@@ -378,10 +378,11 @@ endif()
 
 # BSA needs sm_80+ (FA-2 derived kernel uses BF16 tensor cores). Auto-disable
 # on legacy arches with a clear message instead of failing the link.
-if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA)
+if(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_ENABLE_BSA AND NOT DFLASH27B_HIP_SM80_EQUIV)
     message(WARNING
         "DFLASH27B_ENABLE_BSA=ON requested with DFLASH27B_GPU_BACKEND=hip; "
-        "disabling BSA because the bundled implementation is CUDA/CUTLASS-only.")
+        "disabling BSA because the bundled implementation is CUDA/CUTLASS-only. "
+        "Build with -DDFLASH27B_HIP_SM80_EQUIV=ON to enable the rocWMMA HIP BSA path.")
     set(DFLASH27B_ENABLE_BSA OFF)
 endif()
 if(DFLASH27B_ENABLE_BSA)

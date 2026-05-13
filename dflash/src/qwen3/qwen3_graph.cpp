@@ -209,6 +209,13 @@ inline uint16_t f32_to_f16(float f) {
 
 } // namespace
 
+#if defined(DFLASH27B_BACKEND_HIP)
+extern "C" void launch_rms_norm_mul_w_f32(
+    const float * src, const float * w, float * dst,
+    int n_tokens, int hidden, float eps,
+    cudaStream_t stream);
+#endif
+
 bool forward_qwen3_drafter_model(
     const Qwen3DrafterWeights & w,
     const std::vector<int32_t> & ids,
@@ -588,10 +595,6 @@ bool forward_qwen3_drafter_model(
             set_last_error("graph B reusable build failed at layer " + std::to_string(il));
             ggml_gallocr_free(galloc); cleanup_all(); return false;
         }
-        std::vector<float> ffn_norm_cpu((size_t)hidden);
-        ggml_backend_tensor_get(L.ffn_norm, ffn_norm_cpu.data(), 0, ffn_norm_cpu.size() * sizeof(float));
-        std::vector<float> h_after_cpu((size_t)hidden * chunk_s_ff_v);
-        std::vector<float> hf_cpu((size_t)hidden * chunk_s_ff_v);
         auto tB_setup1 = std::chrono::steady_clock::now();
         t_b_setup += std::chrono::duration<double>(tB_setup1 - tB_setup0).count();
         if (debug_first_layer) {
@@ -683,20 +686,13 @@ bool forward_qwen3_drafter_model(
             one(gb.gf_proj_add, proj_s);
 
             auto tB_norm0 = std::chrono::steady_clock::now();
-            ggml_backend_tensor_get(gb.h_after, h_after_cpu.data(), 0, h_bytes);
-            for (int tok_idx = 0; tok_idx < cl; ++tok_idx) {
-                const size_t base = (size_t)tok_idx * hidden;
-                double sumsq = 0.0;
-                for (int i = 0; i < hidden; ++i) {
-                    const float v = h_after_cpu[base + i];
-                    sumsq += (double) v * (double) v;
-                }
-                const float inv = 1.0f / std::sqrt((float)(sumsq / hidden) + eps);
-                for (int i = 0; i < hidden; ++i) {
-                    hf_cpu[base + i] = h_after_cpu[base + i] * inv * ffn_norm_cpu[(size_t)i];
-                }
-            }
-            ggml_backend_tensor_set(gb.hf, hf_cpu.data(), 0, h_bytes);
+            launch_rms_norm_mul_w_f32(
+                (const float *)gb.h_after->data,
+                (const float *)L.ffn_norm->data,
+                (float *)gb.hf->data,
+                cl, hidden, eps,
+                /*stream=*/nullptr);
+            cudaDeviceSynchronize();
             auto tB_norm1 = std::chrono::steady_clock::now();
             t_b_norm += std::chrono::duration<double>(tB_norm1 - tB_norm0).count();
 
