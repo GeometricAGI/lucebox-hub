@@ -267,16 +267,35 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
                 pos = p;
                 continue;
             }
-            // Pattern 6: \s+(?!\S) — trailing whitespace not followed by non-ws
-            // Pattern 7: \s+ — general whitespace
+            // Pattern 6: \s+(?!\S) — whitespace NOT followed by non-whitespace
+            // Pattern 7: \s+ — general whitespace (fallback)
+            // Pattern 6 uses backtracking: greedily match all whitespace,
+            // then check if followed by \S. If so, backtrack by 1 char so
+            // the last space can be consumed by Pattern 2's optional leader.
             p = pos;
             c = peek_cp(p, &cl);
+            size_t prev_p = pos;  // position before last whitespace char
             while (cl > 0 && is_whitespace(c)) {
+                prev_p = p;
                 p += cl;
                 c = peek_cp(p, &cl);
             }
-            pieces.push_back(text.substr(pos, p - pos));
-            pos = p;
+            {
+                bool followed_by_non_ws = (p < len && !is_whitespace(c));
+                if (!followed_by_non_ws) {
+                    // Pattern 6: at end or before more whitespace — match all
+                    pieces.push_back(text.substr(pos, p - pos));
+                    pos = p;
+                } else if (prev_p > pos) {
+                    // Pattern 6 backtrack: leave last space for Pattern 2
+                    pieces.push_back(text.substr(pos, prev_p - pos));
+                    pos = prev_p;
+                } else {
+                    // Single space before non-ws: Pattern 6 fails, Pattern 7
+                    pieces.push_back(text.substr(pos, p - pos));
+                    pos = p;
+                }
+            }
             continue;
         }
 
@@ -290,39 +309,90 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string & text) const
 
 // ─── BPE encoding ──────────────────────────────────────────────────────
 
+// Forward GPT-2 byte encoding: raw byte → Unicode codepoint (UTF-8 string).
+// This is the inverse of gpt2_unicode_to_byte (defined later, near decode).
+// Bytes in {33-126, 161-172, 174-255} map to themselves as a codepoint;
+// all others (0-32, 127-160, 173) map to U+0100..U+0143.
+static std::string byte_to_gpt2_unicode(uint8_t b) {
+    // Build forward table once: byte → codepoint.
+    static uint32_t fwd[256] = {0};
+    static bool built = false;
+    if (!built) {
+        int n = 0;
+        for (int i = 0; i < 256; i++) {
+            if ((i >= 33  && i <= 126) ||
+                (i >= 161 && i <= 172) ||
+                (i >= 174 && i <= 255)) {
+                fwd[i] = (uint32_t)i;
+            } else {
+                fwd[i] = 256 + n;
+                n++;
+            }
+        }
+        built = true;
+    }
+    uint32_t cp = fwd[b];
+    // Encode codepoint as UTF-8.
+    char buf[4];
+    int len;
+    if (cp < 0x80) {
+        buf[0] = (char)cp; len = 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        len = 2;
+    } else {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        len = 3;
+    }
+    return std::string(buf, len);
+}
+
+// Convert a raw UTF-8 text piece to GPT-2 byte-encoded form for BPE lookup.
+static std::string encode_gpt2_bpe(const std::string & text) {
+    std::string out;
+    out.reserve(text.size() * 2);  // GPT-2 encoding may expand
+    for (uint8_t b : text) {
+        out += byte_to_gpt2_unicode(b);
+    }
+    return out;
+}
+
 // Encode a single pre-tokenized piece using BPE merges.
 std::vector<int32_t> Tokenizer::bpe_encode_piece(const std::string & piece) const {
     if (piece.empty()) return {};
+
+    // Convert raw text to GPT-2 byte encoding for vocab lookup.
+    // The GGUF vocab stores tokens in GPT-2's byte-to-unicode encoding,
+    // so " world" becomes "Ġworld" (space 0x20 → Ġ U+0120).
+    std::string encoded = encode_gpt2_bpe(piece);
 
     // Start with individual bytes/chars as initial symbols.
     // Each symbol is a string that we look up in the vocab.
     std::vector<std::string> symbols;
 
-    // Try to find the piece as a single token first (common for special tokens).
-    auto it = token_to_id_.find(piece);
+    // Try to find the encoded piece as a single token first.
+    auto it = token_to_id_.find(encoded);
     if (it != token_to_id_.end()) {
         return { it->second };
     }
 
-    // Split into individual UTF-8 bytes as initial BPE symbols.
-    // Qwen models use byte-level BPE where each byte maps to a token.
-    for (size_t i = 0; i < piece.size(); ) {
-        int clen = utf8_len((uint8_t)piece[i]);
-        std::string sym = piece.substr(i, clen);
-        // Check if this char exists as a token
+    // Split into individual GPT-2-encoded bytes as initial BPE symbols.
+    // Each raw byte becomes a single GPT-2 Unicode character (possibly multi-byte UTF-8).
+    for (size_t i = 0; i < piece.size(); i++) {
+        std::string sym = byte_to_gpt2_unicode((uint8_t)piece[i]);
         auto sit = token_to_id_.find(sym);
         if (sit != token_to_id_.end()) {
             symbols.push_back(sym);
         } else {
-            // Byte-fallback: try individual bytes
-            for (int b = 0; b < clen; b++) {
-                char buf[8];
-                std::snprintf(buf, sizeof(buf), "<0x%02X>",
-                              (unsigned)(uint8_t)piece[i + b]);
-                symbols.push_back(buf);
-            }
+            // Byte-fallback: use <0xNN> tokens
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "<0x%02X>",
+                          (unsigned)(uint8_t)piece[i]);
+            symbols.push_back(buf);
         }
-        i += clen;
     }
 
     if (symbols.size() <= 1) {
@@ -417,6 +487,30 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
         }
     }
 
+    // Load token types and build added-tokens list.
+    // GGUF token_type: 1=normal, 3=control, 4=user-defined, 5=unused
+    // Types 3 and 4 are "special" tokens matched as whole strings before BPE.
+    int type_key = gguf_find_key(gctx, "tokenizer.ggml.token_type");
+    if (type_key >= 0) {
+        const int n_types = gguf_get_arr_n(gctx, type_key);
+        for (int i = 0; i < n_types && i < n_vocab; i++) {
+            uint32_t ttype = ((const uint32_t *)gguf_get_arr_data(gctx, type_key))[i];
+            if (ttype == 3 || ttype == 4) {
+                const std::string & tok = id_to_token_[i];
+                if (!tok.empty()) {
+                    added_tokens_.push_back({tok, (int32_t)i});
+                }
+            }
+        }
+        // Sort longest-first for greedy matching.
+        std::sort(added_tokens_.begin(), added_tokens_.end(),
+                  [](const auto & a, const auto & b) {
+                      return a.first.size() > b.first.size();
+                  });
+        std::fprintf(stderr, "[tokenizer] added_tokens: %zu special tokens\n",
+                     added_tokens_.size());
+    }
+
     // Detect pre-tokenizer type.
     int pre_key = gguf_find_key(gctx, "tokenizer.ggml.pre");
     if (pre_key >= 0) {
@@ -453,13 +547,105 @@ bool Tokenizer::load_from_gguf(const char * model_path) {
 }
 
 std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
-    std::vector<std::string> pieces = pre_tokenize(text);
+    // If no added tokens, fast path: pre-tokenize → BPE entire text.
+    if (added_tokens_.empty()) {
+        std::vector<std::string> pieces = pre_tokenize(text);
+        std::vector<int32_t> ids;
+        for (const auto & piece : pieces) {
+            auto piece_ids = bpe_encode_piece(piece);
+            ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
+        }
+        return ids;
+    }
+
+    // Split text into segments: alternating normal text and special tokens.
+    // Special tokens are matched greedily (longest first).
     std::vector<int32_t> ids;
-    for (const auto & piece : pieces) {
-        auto piece_ids = bpe_encode_piece(piece);
-        ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Try to match any added token at current position.
+        bool matched = false;
+        for (const auto & [tok_str, tok_id] : added_tokens_) {
+            if (pos + tok_str.size() <= text.size() &&
+                text.compare(pos, tok_str.size(), tok_str) == 0) {
+                ids.push_back(tok_id);
+                pos += tok_str.size();
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+
+        // Find the next special token (or end of string).
+        size_t next_special = text.size();
+        for (const auto & [tok_str, tok_id] : added_tokens_) {
+            size_t found = text.find(tok_str, pos);
+            if (found != std::string::npos && found < next_special) {
+                next_special = found;
+            }
+        }
+
+        // Pre-tokenize + BPE the normal segment.
+        std::string segment = text.substr(pos, next_special - pos);
+        std::vector<std::string> pieces = pre_tokenize(segment);
+        for (const auto & piece : pieces) {
+            auto piece_ids = bpe_encode_piece(piece);
+            ids.insert(ids.end(), piece_ids.begin(), piece_ids.end());
+        }
+        pos = next_special;
     }
     return ids;
+}
+
+// GPT-2 byte-level BPE uses a Unicode mapping where each byte 0-255 is
+// represented by a specific Unicode codepoint.  Bytes that already have a
+// printable representation (33-126, 161-172, 174-255) map to themselves;
+// all other bytes (0-32, 127-160, 173) are offset into U+0100..U+0143.
+// Token strings in the GGUF vocabulary are stored in this encoding, so we
+// must reverse-map each codepoint back to its original byte.
+
+static uint8_t gpt2_unicode_to_byte(uint32_t cp) {
+    // Direct-mapped ranges: the codepoint IS the byte.
+    if ((cp >= 33  && cp <= 126) ||
+        (cp >= 161 && cp <= 172) ||
+        (cp >= 174 && cp <= 255)) {
+        return (uint8_t)cp;
+    }
+    // Offset-mapped range: U+0100..U+0143 → non-printable bytes.
+    // Build the reverse table on first call.
+    static uint8_t table[68] = {0};
+    static bool built = false;
+    if (!built) {
+        int n = 0;
+        for (int b = 0; b < 256; b++) {
+            if ((b >= 33  && b <= 126) ||
+                (b >= 161 && b <= 172) ||
+                (b >= 174 && b <= 255)) continue;
+            // byte b maps to codepoint 256+n
+            table[n] = (uint8_t)b;
+            n++;
+        }
+        built = true;
+    }
+    if (cp >= 256 && cp < 256 + 68) {
+        return table[cp - 256];
+    }
+    // Shouldn't happen for valid BPE tokens — return replacement.
+    return '?';
+}
+
+static std::string decode_gpt2_bpe(const std::string & tok) {
+    std::string out;
+    out.reserve(tok.size());
+    const char * p = tok.c_str();
+    const char * end = p + tok.size();
+    while (p < end) {
+        int cplen;
+        uint32_t cp = utf8_decode(p, &cplen);
+        out.push_back((char)gpt2_unicode_to_byte(cp));
+        p += cplen;
+    }
+    return out;
 }
 
 std::string Tokenizer::token_text(int32_t id) const {
@@ -475,7 +661,13 @@ std::string Tokenizer::token_text(int32_t id) const {
         }
     }
 
-    return tok;
+    // Special tokens (e.g. <|im_start|>) — return as-is.
+    if (!tok.empty() && tok[0] == '<' && tok.back() == '>') {
+        return tok;
+    }
+
+    // Decode GPT-2 byte-level BPE encoding → raw bytes.
+    return decode_gpt2_bpe(tok);
 }
 
 std::string Tokenizer::decode(const std::vector<int32_t> & ids) const {
@@ -484,6 +676,12 @@ std::string Tokenizer::decode(const std::vector<int32_t> & ids) const {
         result += token_text(id);
     }
     return result;
+}
+
+const std::string & Tokenizer::raw_token(int32_t id) const {
+    static const std::string empty;
+    if (id < 0 || id >= (int32_t)id_to_token_.size()) return empty;
+    return id_to_token_[id];
 }
 
 int32_t Tokenizer::token_to_id(const std::string & token) const {

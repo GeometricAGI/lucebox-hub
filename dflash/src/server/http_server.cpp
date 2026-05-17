@@ -405,6 +405,14 @@ void HttpServer::worker_loop() {
             if (client_disconnected) return false;
             completion_tokens++;
 
+            // Skip EOS/EOT/special tokens — don't forward to SSE.
+            int32_t eos = tokenizer_.eos_id();
+            if (token == eos) return true;
+            // Also skip common Qwen3 special tokens by checking if the raw
+            // token text starts with '<|' (e.g. <|im_end|>, <|im_start|>).
+            const std::string & raw = tokenizer_.raw_token(token);
+            if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|') return true;
+
             std::string text = tokenizer_.token_text(token);
 
             if (req.stream && !text.empty()) {

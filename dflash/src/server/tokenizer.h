@@ -37,6 +37,10 @@ public:
     // Returns empty string for out-of-range IDs.
     std::string token_text(int32_t id) const;
 
+    // Return the raw BPE-encoded token string (as stored in the GGUF vocab).
+    // Useful for checking special tokens without GPT-2 decode overhead.
+    const std::string & raw_token(int32_t id) const;
+
     // Convert a sequence of token IDs to text.
     std::string decode(const std::vector<int32_t> & ids) const;
 
@@ -63,6 +67,10 @@ private:
 
     // BPE merge ranks: "A B" → rank (lower = higher priority)
     std::unordered_map<std::string, int> merge_rank_;
+
+    // Added special tokens (e.g. <think>, </think>) — sorted longest-first
+    // for greedy matching during encode.
+    std::vector<std::pair<std::string, int32_t>> added_tokens_;
 
     // Special token IDs
     int32_t bos_id_ = -1;
