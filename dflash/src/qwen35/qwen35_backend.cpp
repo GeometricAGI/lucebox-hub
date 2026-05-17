@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace dflash27b {
@@ -388,7 +389,10 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
     (void)io;
 
     const int hidden = w_.n_embd;
-    const int PREFILL_UBATCH = 512;
+    int prefill_ubatch = 512;
+    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
+        prefill_ubatch = std::max(1, std::atoi(s));
+    }
     const int prompt_len = (int)tokens.size();
 
     // Migrate to full-mode KV cache if needed
@@ -399,7 +403,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
                           target_backend_, cache_);
 
     // Chunked prefill
-    std::vector<float> embed_buf((size_t)hidden * PREFILL_UBATCH);
+    std::vector<float> embed_buf((size_t)hidden * prefill_ubatch);
     int committed = 0;
     for (int start = 0; start < prompt_len;) {
         if (snap_pos >= 0 && snap_slot >= 0 && snap_pos == start) {
@@ -412,7 +416,7 @@ int Qwen35Backend::do_prefill(const std::vector<int32_t> & tokens,
             snap_slot = -1;
         }
 
-        int n_tokens = std::min(PREFILL_UBATCH, prompt_len - start);
+        int n_tokens = std::min(prefill_ubatch, prompt_len - start);
         if (snap_pos > start && snap_pos < start + n_tokens) {
             n_tokens = snap_pos - start;
         }
