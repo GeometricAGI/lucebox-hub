@@ -312,6 +312,14 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         sampler_rng_.seed(sampler_.seed);
     }
 
+    // Reset stateful tensors (SSM hidden state, cur_pos, rollback buffers).
+    // Without this the Qwen3.6 hybrid SSM layers carry hidden state from the
+    // previous bare-prompt request, which silently corrupts decode after a few
+    // back-to-back requests (out=0 finish=stop cascade).
+    // layer_split_daemon_loop.cpp already does this; the single-GPU path here
+    // didn't.
+    reset_target_cache(cache_);
+
     // Prefill
     const int committed = do_prefill(req.prompt, io, req.snap_pos, req.snap_slot);
     if (committed < 0) {
