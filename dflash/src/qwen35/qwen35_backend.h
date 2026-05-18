@@ -110,6 +110,7 @@ private:
     // ── GPU backends ─────────────────────────────────────────────────
     ggml_backend_t target_backend_ = nullptr;
     ggml_backend_t draft_backend_  = nullptr;
+    ggml_backend_t snap_backend_   = nullptr;  // snapshot storage (CPU or unified)
     bool           split_gpus_     = false;
 
     // ── Model weights + caches ───────────────────────────────────────

@@ -39,6 +39,7 @@ using a uniform stdin/stdout protocol.
 dflash/src/
 ├── common/                 # Shared infrastructure (all backends)
 │   ├── model_backend.h     # ModelBackend abstract interface
+│   ├── snapshot_backend.h  # Platform-aware snapshot backend selection
 │   ├── dflash_target.h     # DFlashTarget interface (spec decode)
 │   ├── daemon_loop.{h,cpp} # Generic stdin/stdout daemon loop
 │   ├── device_placement.h  # Multi-GPU placement config

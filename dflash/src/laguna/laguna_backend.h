@@ -64,6 +64,7 @@ public:
 private:
     LagunaBackendArgs                           args_;
     ggml_backend_t                              backend_   = nullptr;
+    ggml_backend_t                              snap_backend_ = nullptr;
     LagunaTargetWeights                         w_;
     LagunaTargetCache                           cache_;
     std::array<LagunaCacheSnapshot, kMaxSlots>  snapshots_{};

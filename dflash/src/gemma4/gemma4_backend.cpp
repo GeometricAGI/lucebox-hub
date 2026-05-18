@@ -10,6 +10,7 @@
 #include "common/io_utils.h"
 
 #include "ggml-cuda.h"
+#include "common/snapshot_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,6 +30,13 @@ bool Gemma4Backend::init() {
     backend_ = ggml_backend_cuda_init(cfg_.device.gpu);
     if (!backend_) {
         std::fprintf(stderr, "[gemma4] CUDA backend init failed (gpu=%d)\n", cfg_.device.gpu);
+        return false;
+    }
+
+    snap_backend_ = create_snapshot_backend(backend_);
+    if (!snap_backend_) {
+        std::fprintf(stderr, "[gemma4] snapshot backend init failed\n");
+        ggml_backend_free(backend_); backend_ = nullptr;
         return false;
     }
 
@@ -281,7 +289,7 @@ bool Gemma4Backend::snapshot_save(int slot) {
         }
     }
 
-    snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend_);
+    snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, snap_backend_);
     if (!snap.buf) {
         ggml_free(snap.ctx); snap.ctx = nullptr;
         return false;
@@ -341,6 +349,8 @@ void Gemma4Backend::shutdown() {
     for (int i = 0; i < PREFIX_SLOTS; ++i) snapshot_free(i);
     free_gemma4_cache(cache_);
     free_gemma4_weights(w_);
+    free_snapshot_backend(snap_backend_, backend_);
+    snap_backend_ = nullptr;
     if (backend_) { ggml_backend_free(backend_); backend_ = nullptr; }
     std::printf("[gemma4] shutdown\n"); std::fflush(stdout);
 }

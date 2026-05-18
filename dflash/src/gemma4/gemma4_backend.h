@@ -67,6 +67,7 @@ public:
 private:
     Gemma4BackendConfig   cfg_;
     ggml_backend_t        backend_ = nullptr;
+    ggml_backend_t        snap_backend_ = nullptr;
     Gemma4Weights         w_;
     Gemma4Cache           cache_;
     bool                  parked_ = false;

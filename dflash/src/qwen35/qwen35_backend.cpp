@@ -12,6 +12,7 @@
 #include "qwen3/qwen3_drafter.h"
 
 #include "ggml-cuda.h"
+#include "common/snapshot_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -51,6 +52,14 @@ bool Qwen35Backend::init() {
     }
     if (split_gpus_ && g_peer_access_opt_in) {
         enable_peer_access_pair(cfg_.device.gpu, cfg_.draft_gpu);
+    }
+
+    // Snapshot backend: on discrete GPU uses system RAM; on unified memory
+    // (Metal, iGPU) stays on compute backend.
+    snap_backend_ = create_snapshot_backend(target_backend_);
+    if (!snap_backend_) {
+        std::fprintf(stderr, "snapshot backend init failed\n");
+        return false;
     }
 
     // Load target
@@ -173,7 +182,7 @@ bool Qwen35Backend::snapshot_save(int slot) {
     if (slot < 0 || slot >= PREFIX_SLOTS) return false;
     snapshot_free(slot);
     PrefixSnapshot & snap = prefix_snapshots_[slot];
-    return snapshot_target_cache(w_, cache_, target_backend_, snap);
+    return snapshot_target_cache(w_, cache_, snap_backend_, snap);
 }
 
 void Qwen35Backend::snapshot_free(int slot) {
@@ -296,7 +305,7 @@ bool Qwen35Backend::try_handle_command(const std::string & line, const DaemonIO 
         if (slot >= 0 && slot < PREFIX_SLOTS) {
             snapshot_free(slot);
             PrefixSnapshot & snap = prefix_snapshots_[slot];
-            snapshot_target_cache_thin(w_, cache_, target_backend_,
+            snapshot_target_cache_thin(w_, cache_, snap_backend_,
                                        /*kv_start=*/0, /*kv_end=*/cache_.cur_pos, snap);
             std::printf("[snapshot_thin] slot=%d pos=%d\n", slot, snap.cur_pos);
             std::fflush(stdout);
@@ -340,6 +349,10 @@ void Qwen35Backend::shutdown() {
     if (target_backend_) {
         ggml_backend_free(target_backend_);
         target_backend_ = nullptr;
+    }
+    if (snap_backend_) {
+        free_snapshot_backend(snap_backend_, target_backend_);
+        snap_backend_ = nullptr;
     }
 }
 

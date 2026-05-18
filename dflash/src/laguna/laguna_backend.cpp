@@ -11,6 +11,7 @@
 #include "dflash27b.h"
 
 #include "ggml-cuda.h"
+#include "common/snapshot_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -33,6 +34,13 @@ bool LagunaBackend::init() {
     backend_ = ggml_backend_cuda_init(0);
     if (!backend_) {
         std::fprintf(stderr, "cuda init failed\n");
+        return false;
+    }
+
+    snap_backend_ = create_snapshot_backend(backend_);
+    if (!snap_backend_) {
+        std::fprintf(stderr, "snapshot backend init failed\n");
+        ggml_backend_free(backend_); backend_ = nullptr;
         return false;
     }
 
@@ -105,7 +113,7 @@ bool LagunaBackend::ensure_slot(int slot) {
         return false;
     }
     if (!snapshots_[slot].ctx) {
-        if (!laguna_snapshot_alloc(cache_, backend_, w_.n_layer, args_.max_ctx,
+        if (!laguna_snapshot_alloc(cache_, snap_backend_, w_.n_layer, args_.max_ctx,
                                     w_.n_head_kv, w_.head_dim, snapshots_[slot])) {
             std::fprintf(stderr, "[snap] alloc slot=%d: %s\n", slot,
                           dflash27b_last_error());
@@ -414,6 +422,8 @@ void LagunaBackend::shutdown() {
         free_laguna_target_cache(cache_);
         free_laguna_target_weights(w_);
     }
+    free_snapshot_backend(snap_backend_, backend_);
+    snap_backend_ = nullptr;
     if (backend_) {
         ggml_backend_free(backend_);
         backend_ = nullptr;
