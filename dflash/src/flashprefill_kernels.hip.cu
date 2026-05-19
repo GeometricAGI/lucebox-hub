@@ -113,30 +113,36 @@ __global__ void compute_block_score_kernel_bf16(
     const int kh           = qh * n_k_heads / n_q_heads;
     const int tid          = threadIdx.x;
     const int q_row_global = q_block_idx * BLOCK + tid;
-    // Guard against the last partial block reading past the real sequence boundary.
-    if (tid >= BLOCK || q_row_global >= seq_len) return;
+    // Threads beyond the real sequence on the last partial block must still
+    // reach every __syncthreads() below; use a flag instead of early return.
+    const bool active = (tid < BLOCK) && (q_row_global < seq_len);
 
-    const hip_bfloat16 * Qp = Q + (size_t)b * s_Q_b
-                                 + (size_t)q_row_global * s_Q_n
-                                 + (size_t)qh * s_Q_h;
-    float q_reg[D_HEAD];
-    #pragma unroll
-    for (int d = 0; d < D_HEAD; ++d)
-        q_reg[d] = static_cast<float>(Qp[(size_t)d * s_Q_d]);
+    float q_reg[D_HEAD] = {};
+    if (active) {
+        const hip_bfloat16 * Qp = Q + (size_t)b * s_Q_b
+                                     + (size_t)q_row_global * s_Q_n
+                                     + (size_t)qh * s_Q_h;
+        #pragma unroll
+        for (int d = 0; d < D_HEAD; ++d)
+            q_reg[d] = static_cast<float>(Qp[(size_t)d * s_Q_d]);
+    }
 
     extern __shared__ float smem[];
 
     for (int n = 0; n <= q_block_idx; ++n) {
-        const hip_bfloat16 * mKp = mean_K + (size_t)b * s_mK_b
-                                           + (size_t)n * s_mK_m
-                                           + (size_t)kh * s_mK_h;
         float dot = 0.0f;
-        #pragma unroll
-        for (int d = 0; d < D_HEAD; ++d)
-            dot += q_reg[d] * static_cast<float>(mKp[(size_t)d * s_mK_d]);
-        dot *= sm_scale * 1.4426950408889634f;
+        if (active) {
+            const hip_bfloat16 * mKp = mean_K + (size_t)b * s_mK_b
+                                               + (size_t)n * s_mK_m
+                                               + (size_t)kh * s_mK_h;
+            #pragma unroll
+            for (int d = 0; d < D_HEAD; ++d)
+                dot += q_reg[d] * static_cast<float>(mKp[(size_t)d * s_mK_d]);
+            dot *= sm_scale * 1.4426950408889634f;
+        }
 
-        smem[tid] = dot;
+        // Inactive threads contribute -inf so they don't skew the max reduction.
+        smem[tid] = active ? dot : -__FLT_MAX__;
         __syncthreads();
         for (int off = BLOCK / 2; off > 0; off >>= 1) {
             if (tid < off) smem[tid] = fmaxf(smem[tid], smem[tid + off]);
@@ -145,7 +151,8 @@ __global__ void compute_block_score_kernel_bf16(
         float m_block = smem[0];
         __syncthreads();
 
-        smem[tid] = exp2f(dot - m_block);
+        // Inactive threads contribute 0 to the sum reduction.
+        smem[tid] = active ? exp2f(dot - m_block) : 0.0f;
         __syncthreads();
         for (int off = BLOCK / 2; off > 0; off >>= 1) {
             if (tid < off) smem[tid] += smem[tid + off];

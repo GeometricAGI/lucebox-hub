@@ -253,13 +253,16 @@ int flash_prefill_forward_bf16(
     int s_idx_b = M * N * H, s_idx_m = N * H, s_idx_n = H, s_idx_h = 1;
     int s_cnt_b = M * H, s_cnt_m = H, s_cnt_h = 1;
 #ifdef DFLASH27B_BACKEND_HIP
-    // mean_Q layout: [B, M, H, D] BF16
-    int s_mQ_b = M * H * D, s_mQ_m = H * D, s_mQ_h = D;
+    // mean_Q layout: [B, M_gemm, H, D] BF16 (batch stride uses M_gemm after padding)
+    int s_mQ_b = M * H * D, s_mQ_m = H * D, s_mQ_h = D;  // s_mQ_b fixed below after M_gemm
     // The GEMM kernel (compute_block_score_gemm_bf16) loads 16×16 rocWMMA tiles and
     // always reads 16 rows of mean_Q/mean_K regardless of M. If M < 16 the last
     // (16-M) rows fall outside the allocation → GPU memory fault. Pad to next
     // multiple of 16 so those reads land in allocated (harmless) memory.
+    // Batch strides must also use M_gemm so batch ≥1 starts at the right offset.
     const int M_gemm = ((M + 15) / 16) * 16;
+    s_mK_b = M_gemm * Hk * D;
+    s_mQ_b = M_gemm * H * D;
 #endif
 
     // Allocate scratch on the same device as Q.

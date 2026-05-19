@@ -56,9 +56,9 @@ namespace __hip_bf16_compat_detail {
         // NaN: preserve payload, don't round.
         if ((u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu))
             return static_cast<uint16_t>(u >> 16);
-        // Round bit is bit 15 of u; sticky = any set bit in [14:0].
-        uint32_t rounding = (u & 0x7fffu) + (u >> 15 & 1u);
-        return static_cast<uint16_t>((u + rounding) >> 16);
+        // Add 0x7fff + lsb: rounds up when lower16 > 0x8000, ties to even when lower16 == 0x8000.
+        uint32_t lsb = (u >> 16) & 1u;
+        return static_cast<uint16_t>((u + 0x7fffu + lsb) >> 16);
     }
     inline float bf16_bits_to_float(uint16_t b) {
         uint32_t u = static_cast<uint32_t>(b) << 16;
