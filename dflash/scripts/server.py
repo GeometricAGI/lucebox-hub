@@ -182,6 +182,7 @@ FUNCTION_SIGNATURE_RE = re.compile(
     r"<function=([A-Za-z_][\w.-]*)\((.*?)\)</function>", re.DOTALL)
 TOOL_CODE_RE = re.compile(r"<tool_code>(.*?)</tool_code>", re.DOTALL)
 TOOL_OPEN_TAG = "<tool_call>"
+TOOL_START_TAGS = (TOOL_OPEN_TAG, "<function=", "<tool_code>")
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 
@@ -1393,7 +1394,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     accumulated_reasoning = ""
                     accumulated_raw_text = ""
                     stops = normalize_stop(req.stop)
-                    tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+                    tool_start_tags = TOOL_START_TAGS if req.tools else ()
+                    tag_holdback = max(
+                        len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG),
+                        *(len(tag) for tag in tool_start_tags))
                     stop_holdback = max((len(s) for s in stops), default=0)
                     HOLDBACK = max(tag_holdback, stop_holdback)
                     completion_tokens = 0
@@ -1453,11 +1457,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 else:  # mode == "content"
                                     think_idx = window.find(THINK_OPEN_TAG)
                                     think_close_idx = window.find(THINK_CLOSE_TAG)
-                                    tool_idx  = window.find(TOOL_OPEN_TAG)
+                                    tool_hits = [
+                                        (window.find(tag), "tool")
+                                        for tag in tool_start_tags
+                                        if window.find(tag) != -1
+                                    ]
                                     hits = [(i, t) for i, t in
                                             ((think_idx, "think"),
-                                             (think_close_idx, "think_close"),
-                                             (tool_idx, "tool")) if i != -1]
+                                             (think_close_idx, "think_close"))
+                                            if i != -1] + tool_hits
                                     if hits:
                                         hits.sort()
                                         idx, which = hits[0]
@@ -2445,7 +2453,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 accumulated_text = ""
                 accumulated_reasoning = ""
                 accumulated_raw_text = ""
-                tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+                tool_start_tags = TOOL_START_TAGS if chat_req.tools else ()
+                tag_holdback = max(
+                    len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG),
+                    *(len(tag) for tag in tool_start_tags))
                 HOLDBACK = tag_holdback
                 completion_tokens = 0
                 tool_call_active = False
@@ -2478,11 +2489,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             else:  # content
                                 think_idx = window.find(THINK_OPEN_TAG)
                                 think_close_idx = window.find(THINK_CLOSE_TAG)
-                                tool_idx = window.find(TOOL_OPEN_TAG)
+                                tool_hits = [
+                                    (window.find(tag), "tool")
+                                    for tag in tool_start_tags
+                                    if window.find(tag) != -1
+                                ]
                                 hits = [(i, t) for i, t in
                                         ((think_idx, "think"),
-                                         (think_close_idx, "think_close"),
-                                         (tool_idx, "tool")) if i != -1]
+                                         (think_close_idx, "think_close"))
+                                        if i != -1] + tool_hits
                                 if hits:
                                     hits.sort()
                                     idx, which = hits[0]
