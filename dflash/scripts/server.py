@@ -67,6 +67,51 @@ DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win3
 DEFAULT_BUDGET = 22
 
 
+def _detect_hip_arch() -> str | None:
+    """Return the first non-host HIP GPU arch string, e.g. 'gfx1151', or None."""
+    for tool in ("rocm_agent_enumerator", "rocminfo"):
+        try:
+            out = subprocess.check_output([tool], stderr=subprocess.DEVNULL, timeout=5)
+            for line in out.decode().splitlines():
+                line = line.strip()
+                if tool == "rocm_agent_enumerator":
+                    if line and line != "gfx000":
+                        return line
+                else:
+                    if line.startswith("Name:") and "gfx" in line:
+                        return line.split("gfx", 1)[1].split()[0].strip()
+        except (FileNotFoundError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+_HIP_BUDGET_ADVISORY: dict[str, tuple[int, str]] = {
+    "gfx1100": (8, "+53% decode tok/s vs default 22 on RDNA3"),
+}
+_HIP_ARCH_CONFIRMED: dict[str, str] = {
+    "gfx1151": "RDNA3.5 (Strix Halo) — budget=22 optimal",
+    "gfx1201": "RDNA4 — budget=22 optimal",
+}
+
+
+def _print_hip_budget_advisory(budget: int) -> None:
+    arch = _detect_hip_arch()
+    if arch is None:
+        return
+    prefix = arch[:7]
+    if prefix in _HIP_BUDGET_ADVISORY:
+        rec, note = _HIP_BUDGET_ADVISORY[prefix]
+        if budget != rec:
+            print(f"  [hip] {arch}: consider --budget={rec} ({note})", flush=True)
+        else:
+            print(f"  [hip] {arch}: budget={budget} optimal", flush=True)
+    elif prefix in _HIP_ARCH_CONFIRMED:
+        print(f"  [hip] {arch}: {_HIP_ARCH_CONFIRMED[prefix]}", flush=True)
+    else:
+        print(f"  [hip] {arch}: no advisory; using budget={budget}", flush=True)
+
+
 def _extra_daemon_has_target_sharding(extra: list[str] | None) -> bool:
     """True if we spawn test_dflash with multi-GPU target layer split."""
     if not extra:
@@ -182,6 +227,7 @@ FUNCTION_SIGNATURE_RE = re.compile(
     r"<function=([A-Za-z_][\w.-]*)\((.*?)\)</function>", re.DOTALL)
 TOOL_CODE_RE = re.compile(r"<tool_code>(.*?)</tool_code>", re.DOTALL)
 TOOL_OPEN_TAG = "<tool_call>"
+TOOL_START_TAGS = (TOOL_OPEN_TAG, "<function=", "<tool_code>")
 THINK_OPEN_TAG = "<think>"
 THINK_CLOSE_TAG = "</think>"
 
@@ -734,7 +780,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               verify_mode: str = "ddtree",
               extra_daemon_args: list[str] | None = None,
               lazy_draft: bool = False,
-              verbose_daemon: bool = False) -> FastAPI:
+              verbose_daemon: bool = False,
+              force_no_thinking: bool = False) -> FastAPI:
     import asyncio
     if _extra_daemon_has_target_sharding(extra_daemon_args):
         if prefix_cache_slots > 0 or prefill_cache_slots > 0:
@@ -954,6 +1001,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         tpl_kwargs.update(
             {k: v for k, v in (template_kwargs or {}).items() if k in _ALLOWED_TEMPLATE_KWARGS}
         )
+        # Server-level override: prevent any per-request opt-in.
+        if force_no_thinking:
+            tpl_kwargs["enable_thinking"] = False
         if tools_arg:
             tpl_kwargs["tools"] = tools_arg
         prompt = tokenizer.apply_chat_template(msgs_list, **tpl_kwargs)
@@ -1284,6 +1334,37 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     def _max_tokens_for(req) -> int:
         return getattr(req, "max_completion_tokens", None) or req.max_tokens
 
+    async def _drain_abandoned_stream(kind: str, request_id: str,
+                                      timing: dict) -> None:
+        """Synchronize the daemon stream after an abandoned SSE response.
+
+        If the client disconnects while the daemon is still generating, the
+        daemon continues writing token IDs to r_pipe. Releasing daemon_lock
+        before consuming the sentinel lets the next request read stale tokens.
+        Drain to -1 here so the next request starts from a clean pipe.
+        """
+        if timing.get("daemon_done"):
+            return
+        loop = asyncio.get_running_loop()
+        drain_fut = loop.run_in_executor(None, _drain_until_sentinel, r_pipe)
+        cancelled = False
+        while True:
+            try:
+                drained = await asyncio.shield(drain_fut)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                log.warning(
+                    "%s stream cancellation deferred until daemon sentinel %s",
+                    kind, request_id)
+        timing["daemon_done"] = True
+        timing["abandoned_stream_drained_tokens"] = len(drained)
+        log.warning(
+            "%s stream abandoned %s: drained %d stale daemon tokens",
+            kind, request_id, len(drained))
+        if cancelled:
+            raise asyncio.CancelledError
+
     # ── /v1/chat/completions ────────────────────────────────────────────────
 
     @app.post("/v1/chat/completions")
@@ -1393,7 +1474,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     accumulated_reasoning = ""
                     accumulated_raw_text = ""
                     stops = normalize_stop(req.stop)
-                    tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+                    tool_start_tags = TOOL_START_TAGS if req.tools else ()
+                    tag_holdback = max(
+                        len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG),
+                        *(len(tag) for tag in tool_start_tags))
                     stop_holdback = max((len(s) for s in stops), default=0)
                     HOLDBACK = max(tag_holdback, stop_holdback)
                     completion_tokens = 0
@@ -1453,11 +1537,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 else:  # mode == "content"
                                     think_idx = window.find(THINK_OPEN_TAG)
                                     think_close_idx = window.find(THINK_CLOSE_TAG)
-                                    tool_idx  = window.find(TOOL_OPEN_TAG)
+                                    tool_hits = [
+                                        (window.find(tag), "tool")
+                                        for tag in tool_start_tags
+                                        if window.find(tag) != -1
+                                    ]
                                     hits = [(i, t) for i, t in
                                             ((think_idx, "think"),
-                                             (think_close_idx, "think_close"),
-                                             (tool_idx, "tool")) if i != -1]
+                                             (think_close_idx, "think_close"))
+                                            if i != -1] + tool_hits
                                     if hits:
                                         hits.sort()
                                         idx, which = hits[0]
@@ -1566,6 +1654,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             log.warning(
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
+                            await _drain_abandoned_stream(
+                                "chat.stream", completion_id, timing)
 
                     inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                     _confirm_or_abort_snap(
@@ -1892,6 +1982,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             log.warning(
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
+                            await _drain_abandoned_stream(
+                                "messages.stream", msg_id, timing)
 
                     inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                     _confirm_or_abort_snap(
@@ -2445,7 +2537,10 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 accumulated_text = ""
                 accumulated_reasoning = ""
                 accumulated_raw_text = ""
-                tag_holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+                tool_start_tags = TOOL_START_TAGS if chat_req.tools else ()
+                tag_holdback = max(
+                    len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG),
+                    *(len(tag) for tag in tool_start_tags))
                 HOLDBACK = tag_holdback
                 completion_tokens = 0
                 tool_call_active = False
@@ -2478,11 +2573,15 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             else:  # content
                                 think_idx = window.find(THINK_OPEN_TAG)
                                 think_close_idx = window.find(THINK_CLOSE_TAG)
-                                tool_idx = window.find(TOOL_OPEN_TAG)
+                                tool_hits = [
+                                    (window.find(tag), "tool")
+                                    for tag in tool_start_tags
+                                    if window.find(tag) != -1
+                                ]
                                 hits = [(i, t) for i, t in
                                         ((think_idx, "think"),
-                                         (think_close_idx, "think_close"),
-                                         (tool_idx, "tool")) if i != -1]
+                                         (think_close_idx, "think_close"))
+                                        if i != -1] + tool_hits
                                 if hits:
                                     hits.sort()
                                     idx, which = hits[0]
@@ -2548,6 +2647,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         log.warning(
                             "stream ended before daemon sentinel; "
                             "retaining prompt .bin for in-flight daemon read")
+                        await _drain_abandoned_stream(
+                            "responses.stream", response_id, timing)
 
                 inline_snap_ok = _consume_inline_snap_waiter(snap_waiter)
                 _confirm_or_abort_snap(
@@ -2737,6 +2838,10 @@ def main():
                     help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
     ap.add_argument("--peer-access", action="store_true",
                     help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="Server-level guard: prevent any request from enabling thinking mode "
+                         "via chat_template_kwargs. Useful on hardware (e.g. gfx1151/Strix Halo) "
+                         "where thinking chains consume n_gen budget without benefit.")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
@@ -2813,7 +2918,8 @@ def main():
                     verify_mode=args.verify_mode,
                     extra_daemon_args=placement.daemon_args or None,
                     lazy_draft=args.lazy_draft,
-                    verbose_daemon=args.verbose_daemon)
+                    verbose_daemon=args.verbose_daemon,
+                    force_no_thinking=args.no_thinking)
 
     import uvicorn
     logging.basicConfig(
@@ -2840,6 +2946,7 @@ def main():
               f"keep={prefill_cfg.keep_ratio} drafter={prefill_cfg.drafter_gguf}")
     else:
         print("  pflash    = off")
+    _print_hip_budget_advisory(args.budget)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

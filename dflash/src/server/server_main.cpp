@@ -53,6 +53,11 @@ static void print_usage(const char * prog) {
         "  --ddtree-budget <N>  DDTree budget (default: 64)\n"
         "  --no-cors            Disable CORS headers\n"
         "\n"
+        "KV cache:\n"
+        "  --cache-type-k <type>  KV cache K type (f16,bf16,q4_0,q4_1,q5_0,q5_1,q8_0,tq3_0)\n"
+        "  --cache-type-v <type>  KV cache V type (same choices as above)\n"
+        "                         Default: tq3_0 when max_ctx>6144, else q4_0\n"
+        "\n"
         "PFlash (speculative prefill compression):\n"
         "  --prefill-compression off|auto|always  (default: off)\n"
         "  --prefill-threshold <N>     Token threshold for auto mode (default: 32000)\n"
@@ -79,6 +84,8 @@ int main(int argc, char ** argv) {
     BackendArgs bargs;
     ServerConfig sconfig;
     bargs.model_path = argv[1];
+    std::string cache_type_k;  // explicit --cache-type-k override
+    std::string cache_type_v;  // explicit --cache-type-v override
 
     for (int i = 2; i < argc; i++) {
         if (std::strcmp(argv[i], "--draft") == 0 && i + 1 < argc) {
@@ -139,6 +146,10 @@ int main(int argc, char ** argv) {
             sconfig.disk_cache_continued_interval = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--kv-cache-cold-max") == 0 && i + 1 < argc) {
             sconfig.disk_cache_cold_max_tokens = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
+            cache_type_k = argv[++i];
+        } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
+            cache_type_v = argv[++i];
         } else {
             std::fprintf(stderr, "[server] unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -153,6 +164,29 @@ int main(int argc, char ** argv) {
         sconfig.max_ctx = bargs.device.max_ctx;
     }
 
+    // ── Apply environment defaults (mirrors server.py logic) ────────────
+    // Explicit --cache-type-k/v override via env vars.
+    if (!cache_type_k.empty()) {
+        setenv("DFLASH27B_KV_K", cache_type_k.c_str(), 1);
+    }
+    if (!cache_type_v.empty()) {
+        setenv("DFLASH27B_KV_V", cache_type_v.c_str(), 1);
+    }
+
+    // Auto-select TQ3_0 KV cache for large contexts (saves ~40% VRAM).
+    // Q4_0 remains default for short contexts where quality matters more.
+    if (sconfig.max_ctx > 6144 && cache_type_k.empty() && cache_type_v.empty()) {
+        setenv("DFLASH27B_KV_TQ3", "1", 0);  // don't overwrite user env
+    }
+
+    // PFlash performance defaults: BSA kernel + sparse alpha + full attention window.
+    bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
+    if (pflash_enabled) {
+        setenv("DFLASH_FP_USE_BSA", "1", 0);
+        setenv("DFLASH_FP_ALPHA", "0.85", 0);
+        setenv("DFLASH27B_FA_WINDOW", "0", 0);
+    }
+
     // Load tokenizer.
     std::fprintf(stderr, "[server] loading tokenizer from %s\n", bargs.model_path);
     Tokenizer tokenizer;
@@ -163,7 +197,6 @@ int main(int argc, char ** argv) {
 
     // Load pflash drafter tokenizer (if pflash enabled).
     Tokenizer drafter_tokenizer;
-    bool pflash_enabled = (sconfig.pflash_mode != ServerConfig::PflashMode::OFF);
     if (pflash_enabled) {
         if (sconfig.pflash_drafter_path.empty()) {
             std::fprintf(stderr, "[server] --prefill-compression requires --prefill-drafter\n");
@@ -190,8 +223,39 @@ int main(int argc, char ** argv) {
     }
 
     // Start HTTP server.
-    std::fprintf(stderr, "[server] starting HTTP server on %s:%d (max_ctx=%d, fa_window=%d)\n",
-                 sconfig.host.c_str(), sconfig.port, sconfig.max_ctx, bargs.fa_window);
+    std::fprintf(stderr, "\n");
+    std::fprintf(stderr, "[server] ╭─── Configuration ───────────────────────────────────╮\n");
+    std::fprintf(stderr, "[server] │  host            = %s\n", sconfig.host.c_str());
+    std::fprintf(stderr, "[server] │  port            = %d\n", sconfig.port);
+    std::fprintf(stderr, "[server] │  model           = %s\n", bargs.model_path);
+    std::fprintf(stderr, "[server] │  draft           = %s\n", bargs.draft_path ? bargs.draft_path : "(none)");
+    std::fprintf(stderr, "[server] │  model_name      = %s\n", sconfig.model_name.c_str());
+    std::fprintf(stderr, "[server] │  max_ctx         = %d\n", sconfig.max_ctx);
+    std::fprintf(stderr, "[server] │  max_tokens      = %d\n", sconfig.max_tokens);
+    std::fprintf(stderr, "[server] │  gpu             = %d\n", bargs.device.gpu);
+    std::fprintf(stderr, "[server] │  draft_gpu       = %d\n", bargs.draft_gpu);
+    std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
+    std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
+    std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
+    std::fprintf(stderr, "[server] │  cors            = %s\n", sconfig.enable_cors ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  cache_type_k    = %s\n",
+        cache_type_k.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_k.c_str());
+    std::fprintf(stderr, "[server] │  cache_type_v    = %s\n",
+        cache_type_v.empty() ? (sconfig.max_ctx > 6144 ? "tq3_0 (auto)" : "q4_0 (default)") : cache_type_v.c_str());
+    std::fprintf(stderr, "[server] │  pflash          = %s\n",
+        sconfig.pflash_mode == ServerConfig::PflashMode::AUTO ? "auto" :
+        sconfig.pflash_mode == ServerConfig::PflashMode::ALWAYS ? "always" : "off");
+    if (pflash_enabled) {
+    std::fprintf(stderr, "[server] │  pflash_threshold= %d\n", sconfig.pflash_threshold);
+    std::fprintf(stderr, "[server] │  pflash_keep     = %.3f\n", sconfig.pflash_keep_ratio);
+    std::fprintf(stderr, "[server] │  pflash_drafter  = %s\n", sconfig.pflash_drafter_path.c_str());
+    std::fprintf(stderr, "[server] │  pflash_skip_park= %s\n", sconfig.pflash_skip_park ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  fp_use_bsa      = %s\n", getenv("DFLASH_FP_USE_BSA") ? "ON" : "off");
+    std::fprintf(stderr, "[server] │  fp_alpha        = %s\n", getenv("DFLASH_FP_ALPHA") ? getenv("DFLASH_FP_ALPHA") : "0.12 (default)");
+    }
+    std::fprintf(stderr, "[server] ╰─────────────────────────────────────────────────────╯\n\n");
+
     HttpServer server(*backend, tokenizer, sconfig);
     g_server = &server;
     std::signal(SIGTERM, signal_handler);

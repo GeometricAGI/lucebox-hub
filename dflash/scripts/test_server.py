@@ -622,6 +622,55 @@ def test_chat_completions_streaming_ignores_stray_think_closers(
     assert "</think>" not in text
     assert '"content":"8"' in text or '"content": "8"' in text
 
+
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_chat_completions_streaming_bare_function_tool_call(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    mock_tokenizer.decode.return_value = (
+        "<function=read_file><parameter=path>x.py</parameter></function>"
+    )
+    mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
+
+    client = TestClient(app)
+    response = client.post("/v1/chat/completions", json={
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": "read x.py"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }],
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[6:])
+        for line in response.text.strip().split("\n\n")
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    tool_delta = next(
+        c["choices"][0]["delta"]["tool_calls"][0]
+        for c in chunks
+        if c["choices"][0]["delta"].get("tool_calls")
+    )
+    finish = next(
+        c["choices"][0]["finish_reason"]
+        for c in chunks
+        if c["choices"][0].get("finish_reason")
+    )
+    assert tool_delta["function"]["name"] == "read_file"
+    assert json.loads(tool_delta["function"]["arguments"]) == {"path": "x.py"}
+    assert finish == "tool_calls"
+
+
 @patch("server.os.pipe")
 @patch("server.os.read")
 def test_chat_completions_streaming_replays_exact_raw_text_with_reasoning(
@@ -651,6 +700,16 @@ def test_chat_completions_streaming_replays_exact_raw_text_with_reasoning(
     first = client.post("/v1/chat/completions", json={
         "model": MODEL_NAME,
         "messages": [{"role": "user", "content": "read x.py"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }],
         "stream": True,
     })
     assert first.status_code == 200
@@ -843,6 +902,40 @@ def test_responses_streaming_ignores_stray_think_closers(
     text = response.text
     assert "</think>" not in text
     assert '"delta":"8"' in text or '"delta": "8"' in text
+
+
+@patch("server.os.pipe")
+@patch("server.os.read")
+def test_responses_streaming_bare_function_tool_call(
+        mock_os_read, mock_pipe, mock_tokenizer, app):
+    mock_pipe.return_value = (1, 2)
+    mock_tokenizer.decode.return_value = (
+        "<function=read_file><parameter=path>x.py</parameter></function>"
+    )
+    mock_os_read.side_effect = [struct.pack("<i", 10), struct.pack("<i", -1)]
+
+    client = TestClient(app)
+    response = client.post("/v1/responses", json={
+        "model": MODEL_NAME,
+        "input": "read x.py",
+        "tools": [{
+            "type": "function",
+            "name": "read_file",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        }],
+        "stream": True,
+    })
+
+    assert response.status_code == 200
+    text = response.text
+    assert "event: response.output_item.added" in text
+    assert "event: response.function_call_arguments.done" in text
+    assert '"type":"function_call"' in text or '"type": "function_call"' in text
+    assert '"name":"read_file"' in text or '"name": "read_file"' in text
+    assert '\\"path\\": \\"x.py\\"' in text
 
 
 @patch("server.os.pipe")
