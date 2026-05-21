@@ -64,6 +64,12 @@ struct ServerConfig {
     int         disk_cache_min_tokens = 512; // only persist >= this many tokens
     int         disk_cache_continued_interval = 10240; // continued checkpoint every N tokens
     int         disk_cache_cold_max_tokens = 10240;    // cold prefix for prompts longer than this
+
+    // Optional Jinja chat template (overrides the hardcoded ChatFormat::QWEN3
+    // / LAGUNA renderer when non-empty). Used for tool-using agents that need
+    // the Anthropic tool_use envelope, e.g. froggeric Qwen3.6 template.
+    std::string chat_template_src;          // literal Jinja source (loaded from file)
+    std::string chat_template_path;         // path it was loaded from (logged at startup)
 };
 
 // ─── Parsed request ─────────────────────────────────────────────────────

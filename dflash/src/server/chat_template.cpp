@@ -2,6 +2,16 @@
 
 #include "chat_template.h"
 
+#include "jinja/lexer.h"
+#include "jinja/parser.h"
+#include "jinja/runtime.h"
+#include "jinja/value.h"
+
+#include <nlohmann/json.hpp>
+
+#include <memory>
+#include <stdexcept>
+
 namespace dflash::common {
 
 // Qwen3.5 tool preamble — matches the official Jinja template exactly.
@@ -153,6 +163,105 @@ std::string render_chat_template(
     }
 
     return result;
+}
+
+// ─── Jinja path ─────────────────────────────────────────────────────────
+//
+// Render via a Jinja chat template (e.g. froggeric Qwen3.6 template). Each
+// thread caches the most-recently-parsed program for its template source,
+// so steady-state cost is just the runtime execute (parse happens once per
+// process per template).
+
+namespace {
+
+struct JinjaCache {
+    std::string                       src;
+    std::shared_ptr<jinja::program>   prog;
+};
+
+static thread_local JinjaCache tls_jinja_cache;
+
+static std::shared_ptr<jinja::program> get_or_parse(const std::string & template_src) {
+    if (tls_jinja_cache.prog && tls_jinja_cache.src == template_src) {
+        return tls_jinja_cache.prog;
+    }
+    jinja::lexer lex;
+    jinja::lexer_result lex_res;
+    try {
+        lex_res = lex.tokenize(template_src);
+    } catch (const std::exception & e) {
+        throw std::runtime_error(std::string("jinja lexer: ") + e.what());
+    }
+    auto prog = std::make_shared<jinja::program>(jinja::parse_from_tokens(lex_res));
+    tls_jinja_cache.src  = template_src;
+    tls_jinja_cache.prog = prog;
+    return prog;
+}
+
+}  // namespace
+
+std::string render_chat_template_jinja(
+    const std::string & template_src,
+    const std::vector<ChatMessage> & messages,
+    const std::string & bos_token,
+    const std::string & eos_token,
+    bool add_generation_prompt,
+    bool enable_thinking,
+    const std::string & tools_json)
+{
+    if (template_src.empty()) {
+        throw std::runtime_error("render_chat_template_jinja: template_src is empty");
+    }
+
+    auto prog = get_or_parse(template_src);
+
+    // Build the JSON input that mirrors llama.cpp's
+    // common_chat_template_direct_apply_impl. Field names must match the
+    // names the Jinja templates expect (messages, tools, bos_token,
+    // eos_token, add_generation_prompt, enable_thinking).
+    nlohmann::ordered_json messages_j = nlohmann::ordered_json::array();
+    for (const auto & m : messages) {
+        nlohmann::ordered_json mj;
+        mj["role"]    = m.role;
+        mj["content"] = m.content;
+        if (!m.tool_call_id.empty()) {
+            mj["tool_call_id"] = m.tool_call_id;
+        }
+        messages_j.push_back(std::move(mj));
+    }
+
+    nlohmann::ordered_json inputs;
+    inputs["messages"]              = std::move(messages_j);
+    inputs["bos_token"]             = bos_token;
+    inputs["eos_token"]             = eos_token;
+    inputs["add_generation_prompt"] = add_generation_prompt;
+    inputs["enable_thinking"]       = enable_thinking;
+
+    bool has_tools = !tools_json.empty() && tools_json != "[]" && tools_json != "null";
+    if (has_tools) {
+        try {
+            inputs["tools"] = nlohmann::ordered_json::parse(tools_json);
+        } catch (const std::exception & e) {
+            throw std::runtime_error(
+                std::string("render_chat_template_jinja: failed to parse tools JSON: ") + e.what());
+        }
+    }
+
+    jinja::context ctx(template_src);
+    try {
+        jinja::global_from_json(ctx, inputs, /*mark_input=*/false);
+    } catch (const std::exception & e) {
+        throw std::runtime_error(std::string("jinja global_from_json: ") + e.what());
+    }
+
+    try {
+        jinja::runtime rt(ctx);
+        jinja::value results = rt.execute(*prog);
+        auto parts = jinja::runtime::gather_string_parts(results);
+        return parts->as_string().str();
+    } catch (const std::exception & e) {
+        throw std::runtime_error(std::string("jinja runtime: ") + e.what());
+    }
 }
 
 }  // namespace dflash::common

@@ -49,4 +49,30 @@ std::string render_chat_template(
 // Detect the appropriate chat format for an architecture.
 ChatFormat chat_format_for_arch(const std::string & arch);
 
+// Render chat messages via a Jinja chat template (e.g. froggeric Qwen3.6
+// template, or any of the llama.cpp models/templates/*.jinja files).
+//
+// Mirrors llama.cpp's common_chat_template_direct_apply: parses the template
+// once per thread, converts inputs to jinja values, runs the program, returns
+// the rendered prompt string.
+//
+// `template_src`  literal Jinja source (read from --chat-template-file)
+// `bos_token`,
+// `eos_token`    passed through to the template (Qwen3.6 templates may use
+//                {{bos_token}} / {{eos_token}}). Use empty strings if unknown.
+// `tools_json`   optional JSON array of tool definitions; when non-empty it
+//                is parsed and injected as `tools` into the template context.
+//
+// Internally caches the most recently parsed program per thread (avoids
+// re-parsing the template on every request). Throws std::runtime_error on
+// lexer/parser/runtime failure (caller should surface a 500 response).
+std::string render_chat_template_jinja(
+    const std::string & template_src,
+    const std::vector<ChatMessage> & messages,
+    const std::string & bos_token,
+    const std::string & eos_token,
+    bool add_generation_prompt = true,
+    bool enable_thinking = false,
+    const std::string & tools_json = "");
+
 }  // namespace dflash::common

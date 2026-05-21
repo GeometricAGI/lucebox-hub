@@ -76,6 +76,13 @@ static void print_usage(const char * prog) {
         "  --kv-cache-min-tokens <N>   Min tokens to persist (default: 512)\n"
         "  --kv-cache-interval <N>     Continued checkpoint every N tokens (default: 10240)\n"
         "  --kv-cache-cold-max <N>     Cold prefix for prompts longer than N tokens (default: 10240)\n"
+        "\n"
+        "Chat template (optional, e.g. froggeric Qwen3.6 template for tool-using\n"
+        "agents that need the Anthropic tool_use envelope):\n"
+        "  --chat-template-file <path>  Load a Jinja chat template file.\n"
+        "                               Overrides the hardcoded Qwen3/Laguna\n"
+        "                               renderer. Empty or missing falls back\n"
+        "                               to the hardcoded template.\n"
         "\n", prog);
 }
 
@@ -143,6 +150,30 @@ int main(int argc, char ** argv) {
             sconfig.pflash_skip_park = true;
         } else if (std::strcmp(argv[i], "--lazy-draft") == 0) {
             sconfig.lazy_draft = true;
+        } else if (std::strcmp(argv[i], "--chat-template-file") == 0 && i + 1 < argc) {
+            const char * path = argv[++i];
+            std::FILE * f = std::fopen(path, "rb");
+            if (!f) {
+                std::fprintf(stderr, "[server] --chat-template-file: cannot open '%s'\n", path);
+                return 1;
+            }
+            std::fseek(f, 0, SEEK_END);
+            long n = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (n <= 0) {
+                std::fclose(f);
+                std::fprintf(stderr, "[server] --chat-template-file: empty file '%s'\n", path);
+                return 1;
+            }
+            sconfig.chat_template_src.resize((size_t)n);
+            size_t got = std::fread(sconfig.chat_template_src.data(), 1, (size_t)n, f);
+            std::fclose(f);
+            if (got != (size_t)n) {
+                std::fprintf(stderr, "[server] --chat-template-file: short read on '%s'\n", path);
+                return 1;
+            }
+            sconfig.chat_template_path = path;
+            std::fprintf(stderr, "[server] loaded chat template from %s (%ld bytes)\n", path, n);
         } else if (std::strcmp(argv[i], "--kv-cache-dir") == 0 && i + 1 < argc) {
             sconfig.disk_cache_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--kv-cache-budget") == 0 && i + 1 < argc) {

@@ -264,6 +264,18 @@ add_library(dflash_common STATIC
     src/server/sse_emitter.cpp
     src/server/prefix_cache.cpp
     src/server/disk_prefix_cache.cpp
+    # ── Jinja chat-template engine (from llama.cpp common/jinja/) ──
+    # Used by render_chat_template_jinja() to support --chat-template-file
+    # in dflash_server. Mirrors llama.cpp's common_chat_template plumbing.
+    # unicode.cpp supplies common_parse_utf8_codepoint() used by jinja's
+    # value.cpp tojson() and is otherwise self-contained.
+    deps/llama.cpp/common/jinja/lexer.cpp
+    deps/llama.cpp/common/jinja/parser.cpp
+    deps/llama.cpp/common/jinja/runtime.cpp
+    deps/llama.cpp/common/jinja/value.cpp
+    deps/llama.cpp/common/jinja/string.cpp
+    deps/llama.cpp/common/jinja/caps.cpp
+    deps/llama.cpp/common/unicode.cpp
 )
 # BSA (Block-Sparse Attention) backs the speculative-prefill drafter scoring
 # path. Default ON so prefill is fast out of the box. Turn OFF if you don't
@@ -452,6 +464,10 @@ target_include_directories(dflash_common
     PRIVATE
         ${DFLASH27B_SRC_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/ggml/src
+        # Jinja chat-template engine (lexer/parser/runtime/value/string/caps)
+        # pulled from llama.cpp/common/jinja for --chat-template-file support.
+        # nlohmann_json is already linked PUBLIC (used by jinja/value.cpp).
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/llama.cpp/common
 )
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_include_directories(dflash_common PRIVATE ${CUDAToolkit_INCLUDE_DIRS})

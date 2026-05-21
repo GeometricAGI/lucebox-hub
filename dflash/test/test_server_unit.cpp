@@ -15,6 +15,7 @@
 #include "server/utf8_utils.h"
 #include "server/api_types.h"
 #include "server/http_server.h"
+#include "server/chat_template.h"
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -577,6 +578,101 @@ static void test_pflash_threshold_always_mode() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Jinja chat template
+// ═══════════════════════════════════════════════════════════════════════
+
+// Minimal Jinja template: just join roles + contents. Used to verify the
+// runtime + global_from_json plumbing without depending on any external
+// .jinja file at test time.
+static const char MINI_JINJA_TEMPLATE[] =
+    "{%- for m in messages -%}"
+    "<|{{ m.role }}|>{{ m.content }}\n"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}"
+    "<|assistant|>"
+    "{%- endif -%}";
+
+static void test_jinja_render_basic() {
+    std::vector<ChatMessage> msgs = {
+        {"system", "you are helpful", ""},
+        {"user",   "hi",              ""},
+    };
+    std::string out = render_chat_template_jinja(
+        MINI_JINJA_TEMPLATE, msgs,
+        /*bos=*/"<s>", /*eos=*/"</s>",
+        /*add_gen=*/true, /*think=*/false,
+        /*tools=*/"");
+    TEST_ASSERT(out.find("<|system|>you are helpful") != std::string::npos);
+    TEST_ASSERT(out.find("<|user|>hi")               != std::string::npos);
+    TEST_ASSERT(out.find("<|assistant|>")            != std::string::npos);
+}
+
+static void test_jinja_render_no_gen_prompt() {
+    std::vector<ChatMessage> msgs = {{"user", "ping", ""}};
+    std::string out = render_chat_template_jinja(
+        MINI_JINJA_TEMPLATE, msgs, "", "",
+        /*add_gen=*/false, /*think=*/false, "");
+    TEST_ASSERT(out.find("<|user|>ping") != std::string::npos);
+    TEST_ASSERT(out.find("<|assistant|>") == std::string::npos);
+}
+
+static void test_jinja_render_tools_injected() {
+    // Template references `tools` to confirm it was passed in.
+    static const char TPL[] =
+        "{%- if tools -%}TOOLS_PRESENT:{{ tools[0].name }}{%- endif -%}"
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    std::string tools = R"([{"name":"my_tool","description":"test"}])";
+    std::string out = render_chat_template_jinja(
+        TPL, msgs, "", "", false, false, tools);
+    TEST_ASSERT(out.find("TOOLS_PRESENT:my_tool") != std::string::npos);
+}
+
+static void test_jinja_render_empty_tools_skipped() {
+    // tools_json == "[]" must NOT define `tools` in the template context.
+    static const char TPL[] =
+        "{%- if tools -%}TOOLS_PRESENT{%- else -%}NO_TOOLS{%- endif -%}";
+    std::vector<ChatMessage> msgs = {{"user", "?", ""}};
+    std::string out = render_chat_template_jinja(
+        TPL, msgs, "", "", false, false, "[]");
+    TEST_ASSERT(out.find("NO_TOOLS")        != std::string::npos);
+    TEST_ASSERT(out.find("TOOLS_PRESENT")   == std::string::npos);
+}
+
+static void test_jinja_render_bos_eos_threaded() {
+    // {{ bos_token }} and {{ eos_token }} must reach the template.
+    static const char TPL[] = "{{ bos_token }}HI{{ eos_token }}";
+    std::vector<ChatMessage> msgs;
+    std::string out = render_chat_template_jinja(
+        TPL, msgs, "<BOS>", "<EOS>", false, false, "");
+    TEST_ASSERT(out == "<BOS>HI<EOS>");
+}
+
+static void test_jinja_render_empty_template_throws() {
+    std::vector<ChatMessage> msgs = {{"user", "x", ""}};
+    bool threw = false;
+    try {
+        (void)render_chat_template_jinja("", msgs, "", "", true, false, "");
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    TEST_ASSERT(threw);
+}
+
+static void test_jinja_render_bad_tools_json_throws() {
+    static const char TPL[] = "{%- for m in messages -%}{{ m.role }}{%- endfor -%}";
+    std::vector<ChatMessage> msgs = {{"user", "x", ""}};
+    bool threw = false;
+    try {
+        (void)render_chat_template_jinja(
+            TPL, msgs, "", "", true, false, "{not valid json");
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    TEST_ASSERT(threw);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Disk Prefix Cache Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -971,6 +1067,15 @@ int main() {
     RUN_TEST(test_pflash_compress_result_defaults);
     RUN_TEST(test_pflash_threshold_auto_mode);
     RUN_TEST(test_pflash_threshold_always_mode);
+
+    std::fprintf(stderr, "\n── Jinja chat template ──\n");
+    RUN_TEST(test_jinja_render_basic);
+    RUN_TEST(test_jinja_render_no_gen_prompt);
+    RUN_TEST(test_jinja_render_tools_injected);
+    RUN_TEST(test_jinja_render_empty_tools_skipped);
+    RUN_TEST(test_jinja_render_bos_eos_threaded);
+    RUN_TEST(test_jinja_render_empty_template_throws);
+    RUN_TEST(test_jinja_render_bad_tools_json_throws);
 
     std::fprintf(stderr, "\n── Disk prefix cache ──\n");
     RUN_TEST(test_disk_cache_config_defaults);

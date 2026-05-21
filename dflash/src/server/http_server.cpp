@@ -439,9 +439,41 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
             tools_json = req.tools.dump();
         }
 
-        std::string rendered = render_chat_template(chat_msgs, chat_format_,
-                                                    true, enable_thinking,
-                                                    tools_json);
+        std::string rendered;
+        if (!config_.chat_template_src.empty()) {
+            // Jinja path: caller supplied a chat template file via
+            // --chat-template-file. Override the hardcoded QWEN3/LAGUNA
+            // renderer. Used for tool-using agents that need the Anthropic
+            // tool_use envelope (e.g. froggeric Qwen3.6 template).
+            //
+            // Special tokens like <|im_start|> / <|im_end|> are stored
+            // verbatim in the GGUF vocab — use raw_token() to skip the
+            // GPT-2 byte decode (otherwise <0xC4><0x91> nonsense appears).
+            const std::string & bos_str = (tokenizer_.bos_id() >= 0)
+                ? tokenizer_.raw_token(tokenizer_.bos_id())
+                : std::string();
+            const std::string & eos_str = (tokenizer_.eos_id() >= 0)
+                ? tokenizer_.raw_token(tokenizer_.eos_id())
+                : std::string();
+            try {
+                rendered = render_chat_template_jinja(
+                    config_.chat_template_src,
+                    chat_msgs,
+                    bos_str,
+                    eos_str,
+                    /*add_generation_prompt=*/true,
+                    enable_thinking,
+                    tools_json);
+            } catch (const std::exception & e) {
+                send_error(fd, 500,
+                    std::string("chat template (jinja) render failed: ") + e.what());
+                return true;
+            }
+        } else {
+            rendered = render_chat_template(chat_msgs, chat_format_,
+                                            true, enable_thinking,
+                                            tools_json);
+        }
         req.prompt_tokens = tokenizer_.encode(rendered);
 
         // Detect if prompt ends with <think> (model will start in reasoning mode).
