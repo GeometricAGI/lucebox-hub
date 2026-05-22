@@ -42,12 +42,12 @@ backend (qwen35, qwen3, gemma4, laguna).
 | `tools` | array | none | Tool/function definitions | ✅ |
 | `reasoning` | object | — | Reasoning effort control (`{"effort":"medium"}`) | ✅ |
 | `chat_template_kwargs` | object | — | Direct template control (`{"enable_thinking":true}`) | ✅ |
-| `stop` | string/array | — | Stop sequences | ❌ TODO 🔴 |
+| `stop` | string/array | — | Stop sequences | ✅ |
 | `n` | int | — | Number of completions | ❌ TODO |
 | `logprobs` | bool | — | Return log probabilities | ❌ TODO |
 | `top_logprobs` | int | — | Number of top logprobs per token | ❌ TODO |
 | `response_format` | object | — | JSON mode / structured output | ❌ TODO |
-| `tool_choice` | string/object | — | Force tool usage | ❌ TODO 🔴 |
+| `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
 | `logit_bias` | object | — | Per-token logit adjustments | ❌ TODO |
 | `user` | string | — | End-user identifier (tracking) | ❌ TODO |
 | `stream_options` | object | — | Streaming options (e.g. include_usage) | ❌ TODO 🔴 |
@@ -90,8 +90,8 @@ backend (qwen35, qwen3, gemma4, laguna).
 | `presence_penalty` | float | 0.0 | Penalize present tokens | ✅ |
 | `thinking` | object | — | Thinking mode (`{"type":"enabled"}`) | ✅ |
 | `tools` | array | — | Tool definitions | ✅ |
-| `tool_choice` | string/object | — | Force tool usage (`"auto"`/`"none"`/`{"name":"..."}`) | ❌ TODO 🔴 |
-| `stop_sequences` | array | — | Stop sequences (up to 4) | ❌ TODO 🔴 |
+| `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
+| `stop_sequences` | array | — | Stop sequences | ✅ |
 | `metadata` | object | — | Request metadata (tracing) | ❌ TODO |
 
 ### Response Structure
@@ -121,7 +121,7 @@ Follows Anthropic Messages API structure with `content` blocks:
 | `presence_penalty` | float | 0.0 | Penalize present tokens | ✅ |
 | `reasoning` | object | — | Reasoning effort | ✅ |
 | `tools` | array | — | Tool definitions | ✅ |
-| `tool_choice` | string | — | Force tool usage (`"auto"`/`"none"`) | ❌ TODO 🔴 |
+| `tool_choice` | string/object | — | Tool choice / force tool usage | ✅ |
 | `parallel_tool_calls` | bool | — | Allow parallel tool calls | ❌ TODO 🔴 |
 | `store` | bool | — | Persist response | ❌ TODO 🔴 |
 | `include` | array | — | Include extra response fields | ❌ TODO 🔴 |
@@ -168,6 +168,7 @@ When `temperature = 0`:
 |---------|--------|-------|
 | Multi-turn conversation | ✅ | Full message history |
 | Tool/function calling | ✅ | XML and JSON tool parsing |
+| Stop sequences | ✅ | OpenAI `stop` and Anthropic `stop_sequences` |
 | Thinking/reasoning | ✅ | OpenAI `reasoning.effort`, Anthropic `thinking.type` |
 | Prefix cache (memory) | ✅ | Automatic KV cache reuse |
 | Prefix cache (disk) | ✅ | Persistent across restarts |
@@ -187,9 +188,6 @@ support causes errors or silent feature degradation.
 
 | Feature | Used By | Notes |
 |---------|---------|-------|
-| **`tool_choice`** | Codex, Claude Code | `"auto"` / `"none"` / `{"type":"function","function":{"name":"..."}}`. Both agents always send this. Currently silently ignored. |
-| **`stop` sequences** | Codex (Chat), Open WebUI | Custom stop strings/tokens. Python server implements this; C++ server does not. |
-| **`stop_sequences`** | Claude Code (Anthropic) | Anthropic-format stop strings. Same underlying feature as `stop`. |
 | **`parallel_tool_calls`** | Codex (Responses API) | Codex always sends `true`. Can accept and ignore (we serialize calls). |
 | **`store`** | Codex (Responses API) | Controls response persistence. Accept field; can be no-op locally. |
 | **`include`** | Codex (Responses API) | Controls what's included in response events. Accept field. |
