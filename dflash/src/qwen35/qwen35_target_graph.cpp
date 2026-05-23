@@ -1191,6 +1191,58 @@ ggml_tensor * build_qwen35_layer(
                               q_tail_capture, q_tail_start, nullptr);
 }
 
+QwenLayerPrefnOutputs build_qwen35_layer_prefn(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    int                   fa_window) {
+    QwenLayerPrefnOutputs out{};
+    const float eps = w.rms_eps;
+    const TargetLayer & L = w.layers[layer_idx];
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+
+    ggml_tensor * inpSA = inp;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
+
+    if (is_attn) {
+        int fa_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
+        }
+        cur = build_full_attn_block(ctx, gf, w, L, cur, positions, w.rope_sections,
+                                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                                    attn_mask, kv_start, n_tokens,
+                                    cache.kv_k_type, cache.kv_v_type,
+                                    cache.kv_k_rotated,
+                                    fa_window);
+    } else {
+        int dn_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
+        }
+        cur = build_delta_net_block(ctx, gf, w, L, cur,
+                                    cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+                                    n_tokens, nullptr, nullptr);
+    }
+
+    cur = ggml_add(ctx, cur, inpSA);
+    out.residual = cur;
+    out.post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+    if (w.is_moe) {
+        Qwen35MoeRouterOutputs router = build_qwen35moe_router(ctx, out.post, w, L);
+        out.moe_selected = router.selected;
+        out.moe_weights = router.weights;
+    }
+    return out;
+}
+
 // ─── Cross-request prefix snapshot (Phase A) ─────────────────────────
 
 bool snapshot_target_cache(const TargetWeights & w,

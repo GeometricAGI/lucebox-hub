@@ -150,6 +150,12 @@ bool Qwen35Backend::load_target_model(ggml_backend_t backend, TargetWeights & ou
     return load_target_gguf(cfg_.target_path, backend, out);
 }
 
+bool Qwen35Backend::run_ar_decode_path(int committed, int n_gen,
+                                       std::vector<int32_t> & out_tokens,
+                                       const DaemonIO & io) {
+    return do_ar_decode(committed, n_gen, out_tokens, io);
+}
+
 // ── print_ready_banner ──────────────────────────────────────────────────
 
 void Qwen35Backend::print_ready_banner() const {
@@ -914,7 +920,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     if (!can_spec) {
         // AR fallback consumes the final prefill position itself, then advances
         // one token at a time.
-        bool ok = do_ar_decode(committed, n_gen, out_tokens, io);
+        bool ok = run_ar_decode_path(committed, n_gen, out_tokens, io);
         io.emit(-1);
         return ok;
     }

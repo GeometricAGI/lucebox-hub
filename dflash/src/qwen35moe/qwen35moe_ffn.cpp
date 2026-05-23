@@ -4,17 +4,14 @@
 
 namespace dflash::common {
 
-ggml_tensor * build_qwen35moe_ffn(
+Qwen35MoeRouterOutputs build_qwen35moe_router(
     ggml_context *        ctx,
     ggml_tensor *         cur,
     const TargetWeights & w,
-    const TargetLayer &   L,
-    ggml_tensor **        selected_out) {
+    const TargetLayer &   L) {
     const int n_tokens = (int)cur->ne[1];
     const int n_expert = w.n_expert;
     const int n_used   = w.n_expert_used;
-    const int n_embd   = w.n_embd;
-    const int n_ff_exp = w.n_ff_exp;
 
     ggml_tensor * logits = apply_scale2(ctx, ggml_mul_mat(ctx, L.ffn_gate_inp, cur), L.ffn_gate_inp_s);
     ggml_tensor * probs = nullptr;
@@ -29,9 +26,6 @@ ggml_tensor * build_qwen35moe_ffn(
     }
 
     ggml_tensor * selected = ggml_top_k(ctx, probs, n_used);
-    if (selected_out) {
-        *selected_out = selected;
-    }
 
     ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
     ggml_tensor * weights  = ggml_get_rows(ctx, probs_3d, selected);
@@ -43,6 +37,30 @@ ggml_tensor * build_qwen35moe_ffn(
     }
     if (w.expert_weights_scale != 1.0f) {
         weights = ggml_scale(ctx, weights, w.expert_weights_scale);
+    }
+
+    Qwen35MoeRouterOutputs out;
+    out.selected = selected;
+    out.weights = weights;
+    return out;
+}
+
+ggml_tensor * build_qwen35moe_ffn(
+    ggml_context *        ctx,
+    ggml_tensor *         cur,
+    const TargetWeights & w,
+    const TargetLayer &   L,
+    ggml_tensor **        selected_out) {
+    const int n_tokens = (int)cur->ne[1];
+    const int n_used   = w.n_expert_used;
+    const int n_embd   = w.n_embd;
+    const int n_ff_exp = w.n_ff_exp;
+
+    Qwen35MoeRouterOutputs router = build_qwen35moe_router(ctx, cur, w, L);
+    ggml_tensor * selected = router.selected;
+    ggml_tensor * weights = router.weights;
+    if (selected_out) {
+        *selected_out = selected;
     }
 
     ggml_tensor * cur_3d = ggml_reshape_3d(ctx, cur, n_embd, 1, n_tokens);

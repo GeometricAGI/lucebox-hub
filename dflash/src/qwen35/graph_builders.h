@@ -40,6 +40,18 @@ bool build_layer_step(
     int fa_window = 0,
     int kq_stride_pad = KQ_MASK_PAD);
 
+bool build_layer_prefn_step(
+    StepGraph & sg,
+    const TargetWeights & w,
+    TargetCache & cache,
+    ggml_backend_t backend,
+    int layer_idx,
+    int kv_start,
+    int n_tokens,
+    bool with_mask,
+    int fa_window = 0,
+    int kq_stride_pad = KQ_MASK_PAD);
+
 // Full target forward: chain mode (all layers, logits + argmax output).
 bool build_target_step(
     StepGraph & sg,

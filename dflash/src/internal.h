@@ -546,6 +546,13 @@ struct QwenGraphOutputs {
     std::vector<ggml_tensor *> moe_selected;
 };
 
+struct QwenLayerPrefnOutputs {
+    ggml_tensor * residual = nullptr; // [hidden, n_tokens]
+    ggml_tensor * post = nullptr;     // [hidden, n_tokens]
+    ggml_tensor * moe_selected = nullptr; // [n_used, n_tokens] i32
+    ggml_tensor * moe_weights = nullptr;  // [n_used, n_tokens] f32
+};
+
 QwenGraphOutputs build_qwen35_graph(
     ggml_context *         ctx,
     ggml_cgraph *          gf,
@@ -571,6 +578,19 @@ ggml_tensor * build_qwen35_layer(
     int                   fa_window = 0,
     ggml_tensor *         q_tail_capture = nullptr,
     int                   q_tail_start = 0);
+
+QwenLayerPrefnOutputs build_qwen35_layer_prefn(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    int                   fa_window = 0);
 
 } // namespace dflash::common
 
