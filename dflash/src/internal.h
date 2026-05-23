@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,8 @@
 #include "dflash27b.h"
 
 namespace dflash::common {
+
+struct Qwen35MoeHybridStorage;
 
 // Single source of truth for error reporting.
 // All loaders / graph builders push into this via set_last_error(...).
@@ -151,6 +154,7 @@ struct TargetWeights {
     std::vector<TargetLayer> layers;         // size = 64
     ggml_tensor * out_norm = nullptr;        // [hidden]
     ggml_tensor * output   = nullptr;        // [hidden, vocab]  (lm_head)
+    std::shared_ptr<Qwen35MoeHybridStorage> moe_hybrid; // optional Phase 3 hybrid storage
 
     // Metadata from GGUF (validated at load time)
     int full_attention_interval = 4;

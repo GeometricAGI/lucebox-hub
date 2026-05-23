@@ -759,6 +759,7 @@ void free_target_weights(TargetWeights & w) {
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     // CpuEmbedder destructor handles the mmap automatically.
+    w.moe_hybrid.reset();
     w.layers.clear();
     w.tok_embd = nullptr;
     w.out_norm = nullptr;
