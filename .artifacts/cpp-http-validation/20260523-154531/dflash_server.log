@@ -1,0 +1,35 @@
+[server] loading tokenizer from /home/junsu/AI/lucebox-hub/dflash/models/Qwen3.6-27B-Q4_K_M.gguf
+[tokenizer] added_tokens: 33 special tokens
+[tokenizer] loaded vocab=248320 merges=247587 bos=248044 eos=248046 eot=248046 pre=qwen35 sp=no
+[server] creating backend...
+[backend_factory] detected arch=qwen35
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 22527 MiB):
+  Device 0: NVIDIA GeForce RTX 2080 Ti, compute capability 7.5, VMM: yes, VRAM: 22527 MiB
+
+[server] ╭─── Configuration ───────────────────────────────────╮
+[server] │  host            = 127.0.0.1
+[server] │  port            = 18080
+[server] │  model           = /home/junsu/AI/lucebox-hub/dflash/models/Qwen3.6-27B-Q4_K_M.gguf
+[server] │  draft           = /home/junsu/AI/lucebox-hub/dflash/models/draft/draft-Qwen3.6-27B.gguf
+[server] │  model_name      = luce-dflash
+[server] │  max_ctx         = 32768
+[server] │  max_tokens      = 512
+[server] │  target_device   = auto:0
+[server] │  draft_device    = auto:0
+[server] │  peer_access     = off
+[server] │  chunk           = 512
+[server] │  fa_window       = 2048
+[server] │  ddtree          = ON
+[server] │  ddtree_budget   = 22
+[server] │  cors            = ON
+[server] │  cache_type_k    = tq3_0 (auto)
+[server] │  cache_type_v    = tq3_0 (auto)
+[server] │  pflash          = off
+[server] │  lazy_draft      = off
+[server] ╰─────────────────────────────────────────────────────╯
+
+[pc] enabled: cap=32 family=qwen
+[server] listening on http://127.0.0.1:18080
+[loader] eos_id=248046 eos_chat_id=-1
+[target] target loaded: layers [0,64) output=1, 850 tensors on GPU 14.99 GiB, tok_embd 682 MiB CPU-only (q4_K)
+[draft]  loaded

@@ -45,6 +45,11 @@ private:
     bool hybrid_telemetry_ = false;
 
     void maybe_post_request_swap();
+    bool load_dynamic_placement(const char * hotness_path,
+                                ggml_backend_t backend,
+                                const TargetWeights & w,
+                                Qwen35MoeExpertPlacement & out,
+                                std::string * err);
 };
 
 }  // namespace dflash::common

@@ -65,4 +65,29 @@ bool build_qwen35moe_hybrid_storage(const TargetWeights & w,
                                     Qwen35MoeHybridStorage & out,
                                     std::string * err = nullptr);
 
+// Expert tensor file data for split loading (one entry per expert tensor).
+struct ExpertTensorFileData {
+    const uint8_t * data = nullptr;  // pointer into mmap
+    size_t size = 0;                 // total tensor size in bytes
+};
+
+// Per-layer expert tensor file data for split loading.
+struct LayerExpertFileData {
+    ExpertTensorFileData gate_exps;
+    ExpertTensorFileData up_exps;
+    ExpertTensorFileData down_exps;
+    ExpertTensorFileData gate_up_exps;  // optional fused
+};
+
+// Build hybrid storage by loading expert data directly from file (mmap).
+// Expert tensors in w are only used for metadata (ne/nb/type); their buffer
+// may be null. Expert data is read from file_data entries.
+bool build_qwen35moe_hybrid_storage_from_file(
+    const TargetWeights & w,
+    ggml_backend_t gpu_backend,
+    const Qwen35MoeExpertPlacement & placement,
+    const std::vector<LayerExpertFileData> & file_data,
+    Qwen35MoeHybridStorage & out,
+    std::string * err = nullptr);
+
 }  // namespace dflash::common

@@ -393,7 +393,7 @@ bool eval_qwen35moe_hybrid_ffn_single(
         }
         const int32_t hot_local = storage.hot_local_by_global[(size_t)gid];
         if (hot_local >= 0) {
-            hot_ids.push_back(gid);
+            hot_ids.push_back(hot_local);  // use LOCAL id for hot tensor indexing
             hot_weights.push_back(selected_weights[i]);
             continue;
         }
@@ -436,9 +436,10 @@ bool eval_qwen35moe_hybrid_ffn_single(
     }
 
     // Fused hot routed + shared FFN in a single GPU graph compute
+    // Uses hot-only tensors with local expert IDs
     const auto hot_t0 = HybridClock::now();
     if (!run_hot_and_shared_ffn_gpu(gpu_backend,
-                                    L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps, L.ffn_gate_up_exps,
+                                    storage.gate_hot, storage.up_hot, storage.down_hot, storage.gate_up_hot,
                                     L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
                                     L, w.n_embd, w.n_ff_exp,
                                     cur_host,

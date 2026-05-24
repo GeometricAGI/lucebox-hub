@@ -1,8 +1,8 @@
 #include "qwen35moe_routing_stats.h"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <numeric>
 
@@ -111,26 +111,11 @@ std::vector<int> Qwen35MoeRoutingStats::hot_experts(int layer_idx, int hot_count
     return ranked;
 }
 
-bool Qwen35MoeRoutingStats::save_json(const std::string & path, std::string * err) const {
+
+bool Qwen35MoeRoutingStats::save_csv(const std::string & path, std::string * err) const {
     if (n_layer <= 0 || n_expert <= 0 || counts.size() != (size_t)n_layer * (size_t)n_expert) {
         if (err) *err = "routing stats not initialized";
         return false;
-    }
-
-    nlohmann::json j;
-    j["arch"] = "qwen35moe";
-    j["version"] = 1;
-    j["n_layer"] = n_layer;
-    j["n_expert"] = n_expert;
-    j["n_expert_used"] = n_expert_used;
-    j["layer_totals"] = layer_totals;
-    j["counts"] = nlohmann::json::array();
-    for (int il = 0; il < n_layer; ++il) {
-        nlohmann::json row = nlohmann::json::array();
-        for (int ie = 0; ie < n_expert; ++ie) {
-            row.push_back(counts[index_of(il, ie)]);
-        }
-        j["counts"].push_back(std::move(row));
     }
 
     std::ofstream f(path);
@@ -138,49 +123,88 @@ bool Qwen35MoeRoutingStats::save_json(const std::string & path, std::string * er
         if (err) *err = "failed to open output file";
         return false;
     }
-    f << j.dump(2);
+
+    // Header comments
+    f << "# hotness table: n_layer=" << n_layer
+      << " n_expert=" << n_expert
+      << " n_expert_used=" << n_expert_used << "\n";
+    f << "# format: one row per layer, columns are expert activation counts (expert 0..N-1)\n";
+
+    for (int il = 0; il < n_layer; ++il) {
+        for (int ie = 0; ie < n_expert; ++ie) {
+            if (ie > 0) f << ',';
+            f << counts[index_of(il, ie)];
+        }
+        f << '\n';
+    }
+
     if (!f) {
-        if (err) *err = "failed to write json";
+        if (err) *err = "failed to write csv";
         return false;
     }
     return true;
 }
 
-bool Qwen35MoeRoutingStats::load_json(const std::string & path,
-                                      Qwen35MoeRoutingStats & out,
-                                      std::string * err) {
+bool Qwen35MoeRoutingStats::load_csv(const std::string & path,
+                                     Qwen35MoeRoutingStats & out,
+                                     std::string * err) {
     std::ifstream f(path);
     if (!f) {
         if (err) *err = "failed to open input file";
         return false;
     }
 
-    nlohmann::json j;
-    try {
-        f >> j;
-    } catch (const std::exception & ex) {
-        if (err) *err = ex.what();
+    int n_layer = 0, n_expert = 0, n_expert_used = 0;
+    std::vector<uint64_t> all_counts;
+    std::string line;
+
+    while (std::getline(f, line)) {
+        // Skip comments and empty lines
+        if (line.empty() || line[0] == '#') {
+            // Try to parse header metadata from comment
+            if (line.find("n_layer=") != std::string::npos) {
+                std::sscanf(line.c_str(), "# hotness table: n_layer=%d n_expert=%d n_expert_used=%d",
+                            &n_layer, &n_expert, &n_expert_used);
+            }
+            continue;
+        }
+
+        // Parse CSV row: comma-separated uint64 values
+        std::vector<uint64_t> row;
+        const char * p = line.c_str();
+        while (*p) {
+            char * end = nullptr;
+            uint64_t val = std::strtoull(p, &end, 10);
+            if (end == p) break;
+            row.push_back(val);
+            p = end;
+            if (*p == ',') ++p;
+        }
+
+        if (row.empty()) continue;
+
+        // Infer n_expert from first data row
+        if (n_expert == 0) {
+            n_expert = (int)row.size();
+        } else if ((int)row.size() != n_expert) {
+            if (err) *err = "inconsistent row width at layer " + std::to_string((int)(all_counts.size() / (size_t)n_expert));
+            return false;
+        }
+
+        all_counts.insert(all_counts.end(), row.begin(), row.end());
+    }
+
+    if (n_expert <= 0 || all_counts.empty()) {
+        if (err) *err = "no data rows found";
         return false;
     }
 
-    if (j.value("arch", std::string()) != "qwen35moe") {
-        if (err) *err = "unexpected arch";
-        return false;
-    }
+    const int detected_layers = (int)(all_counts.size() / (size_t)n_expert);
+    if (n_layer == 0) n_layer = detected_layers;
+    if (n_expert_used == 0) n_expert_used = 8;  // default for Qwen3.5-MoE
 
-    const int n_layer = j.value("n_layer", 0);
-    const int n_expert = j.value("n_expert", 0);
-    const int n_expert_used = j.value("n_expert_used", 0);
-    if (n_layer <= 0 || n_expert <= 0 || n_expert_used <= 0) {
-        if (err) *err = "invalid dimensions";
-        return false;
-    }
-
-    const auto & counts_json = j["counts"];
-    const auto & totals_json = j["layer_totals"];
-    if (!counts_json.is_array() || (int)counts_json.size() != n_layer ||
-        !totals_json.is_array() || (int)totals_json.size() != n_layer) {
-        if (err) *err = "invalid counts shape";
+    if ((int)all_counts.size() != n_layer * n_expert) {
+        if (err) *err = "row count (" + std::to_string(detected_layers) + ") doesn't match n_layer (" + std::to_string(n_layer) + ")";
         return false;
     }
 
@@ -188,19 +212,14 @@ bool Qwen35MoeRoutingStats::load_json(const std::string & path,
     tmp.n_layer = n_layer;
     tmp.n_expert = n_expert;
     tmp.n_expert_used = n_expert_used;
-    tmp.counts.assign((size_t)n_layer * (size_t)n_expert, 0);
+    tmp.counts = std::move(all_counts);
     tmp.layer_totals.assign((size_t)n_layer, 0);
-
     for (int il = 0; il < n_layer; ++il) {
-        const auto & row = counts_json[(size_t)il];
-        if (!row.is_array() || (int)row.size() != n_expert) {
-            if (err) *err = "invalid row width";
-            return false;
-        }
+        uint64_t total = 0;
         for (int ie = 0; ie < n_expert; ++ie) {
-            tmp.counts[tmp.index_of(il, ie)] = row[(size_t)ie].get<uint64_t>();
+            total += tmp.counts[tmp.index_of(il, ie)];
         }
-        tmp.layer_totals[(size_t)il] = totals_json[(size_t)il].get<uint64_t>();
+        tmp.layer_totals[(size_t)il] = total;
     }
 
     out = std::move(tmp);

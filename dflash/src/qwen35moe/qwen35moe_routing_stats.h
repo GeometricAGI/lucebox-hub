@@ -33,10 +33,10 @@ struct Qwen35MoeRoutingStats {
     std::vector<int> ranked_experts(int layer_idx) const;
     std::vector<int> hot_experts(int layer_idx, int hot_count) const;
 
-    bool save_json(const std::string & path, std::string * err = nullptr) const;
-    static bool load_json(const std::string & path,
-                          Qwen35MoeRoutingStats & out,
-                          std::string * err = nullptr);
+    bool save_csv(const std::string & path, std::string * err = nullptr) const;
+    static bool load_csv(const std::string & path,
+                         Qwen35MoeRoutingStats & out,
+                         std::string * err = nullptr);
 
 private:
     size_t index_of(int layer_idx, int expert_idx) const;

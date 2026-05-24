@@ -206,10 +206,28 @@ static bool parse_block_tensor_name(const char * name, int & layer_id) {
     return true;
 }
 
+static bool is_expert_tensor_name(const char * name) {
+    // Expert tensor names: blk.N.ffn_gate_exps.weight, blk.N.ffn_up_exps.weight,
+    // blk.N.ffn_down_exps.weight, blk.N.ffn_gate_up_exps.weight
+    const char * dot = std::strrchr(name, '.');
+    if (!dot) return false;
+    // Check suffix before ".weight"
+    const char * second_dot = dot - 1;
+    while (second_dot > name && *second_dot != '.') --second_dot;
+    if (second_dot <= name) return false;
+    size_t len = (size_t)(dot - second_dot - 1);
+    const char * base = second_dot + 1;
+    return (len == 13 && std::strncmp(base, "ffn_gate_exps", 13) == 0) ||
+           (len == 11 && std::strncmp(base, "ffn_up_exps", 11) == 0) ||
+           (len == 13 && std::strncmp(base, "ffn_down_exps", 13) == 0) ||
+           (len == 16 && std::strncmp(base, "ffn_gate_up_exps", 16) == 0);
+}
+
 static bool should_load_target_tensor(const char * name,
                                       int layer_begin,
                                       int layer_end,
-                                      bool load_output) {
+                                      bool load_output,
+                                      bool skip_expert_tensors = false) {
     if (std::strcmp(name, "token_embd.weight") == 0) return false;
     if (std::strcmp(name, "output_norm.weight") == 0 ||
         std::strcmp(name, "output.weight") == 0) {
@@ -217,7 +235,9 @@ static bool should_load_target_tensor(const char * name,
     }
     int layer_id = -1;
     if (parse_block_tensor_name(name, layer_id)) {
-        return layer_id >= layer_begin && layer_id < layer_end;
+        if (layer_id < layer_begin || layer_id >= layer_end) return false;
+        if (skip_expert_tensors && is_expert_tensor_name(name)) return false;
+        return true;
     }
     return false;
 }
@@ -573,7 +593,7 @@ bool load_target_gguf_partial(const std::string & path,
     for (int64_t tid = 0; tid < n_tensors; tid++) {
         const char * tname = gguf_get_tensor_name(gctx, tid);
         ggml_tensor * t = ggml_get_tensor(meta_ctx, tname);
-        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
+        if (!t || !should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
         alloc_total = align_up_size(alloc_total, alignment);
@@ -638,7 +658,7 @@ bool load_target_gguf_partial(const std::string & path,
             tok_embd_type = gguf_get_tensor_type(gctx, tid);
             continue;
         }
-        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output)) {
+        if (!should_load_target_tensor(tname, plan.layer_begin, plan.layer_end, plan.load_output, plan.skip_expert_tensors)) {
             continue;
         }
         ggml_backend_tensor_set(t, (const uint8_t *)mm.addr + off, 0, sz);
