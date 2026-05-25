@@ -50,12 +50,6 @@ struct Qwen35Config {
     int          draft_swa_window = 0;
     int          draft_ctx_max    = 4096;
 
-    // Draft YaRN rope scaling (set by caller for models that need it).
-    float        draft_yarn_factor    = 0.0f;  // 0 = no YaRN; >1 = enable
-    float        draft_yarn_beta_fast = 32.0f;
-    float        draft_yarn_beta_slow = 1.0f;
-    int          draft_yarn_orig_ctx  = 4096;
-
     // Speculative decode strategy
     bool         fast_rollback   = false;
     bool         seq_verify      = false;

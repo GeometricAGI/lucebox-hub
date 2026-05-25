@@ -1185,27 +1185,6 @@ void HttpServer::worker_loop() {
             std::fprintf(stderr, "[server] client disconnected — generation aborted "
                          "(prompt=%zu out=%d)\n",
                          req.prompt_tokens.size(), completion_tokens);
-        } else if (result.ok) {
-            const char * fmt_name = "raw";
-            switch (req.format) {
-            case ApiFormat::OPENAI_CHAT: fmt_name = "chat"; break;
-            case ApiFormat::ANTHROPIC:  fmt_name = "messages"; break;
-            case ApiFormat::RESPONSES:  fmt_name = "responses"; break;
-            default: break;
-            }
-            const double tok_s = completion_tokens > 0
-                ? completion_tokens / std::max(1e-9, result.decode_s)
-                : 0.0;
-            std::fprintf(stderr,
-                         "[server] %s DONE %s in=%zu out=%d prefill=%.3fs decode=%.3fs tok/s=%.2f finish=%s\n",
-                         fmt_name,
-                         req.model.c_str(),
-                         req.prompt_tokens.size(),
-                         completion_tokens,
-                         result.prefill_s,
-                         result.decode_s,
-                         tok_s,
-                         emitter.finish_reason().c_str());
         }
 
         const auto done_at = std::chrono::steady_clock::now();

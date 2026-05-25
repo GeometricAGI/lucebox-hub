@@ -111,37 +111,6 @@ bool Qwen35Backend::init() {
         }
         std::printf("[draft]  loaded\n");
 
-        // Override draft RoPE theta with target's value — the GGUF was
-        // exported with a stale freq_base (1M) but config.json specifies 10M.
-        if (dw_.rope_theta != w_.rope_theta && w_.rope_theta > 0.0f) {
-            std::printf("[draft]  rope_theta override: %.0f -> %.0f (match target)\n",
-                        dw_.rope_theta, w_.rope_theta);
-            dw_.rope_theta = w_.rope_theta;
-        }
-
-        // Apply YaRN rope scaling if the GGUF didn't provide it.
-        // The 35B draft (8 layers, 4 KV heads) requires YaRN (factor=64, beta_fast=32, beta_slow=1, orig_ctx=4096).
-        // The 27B draft (5 layers, 8 KV heads) uses plain RoPE (no scaling).
-        if (dw_.rope_ext_factor == 0.0f) {
-            float yarn_factor = cfg_.draft_yarn_factor;
-            // Auto-detect: 35B draft has 8 layers and hidden=2048
-            if (yarn_factor <= 1.0f && dw_.n_layer == 8 && dw_.n_embd == 2048) {
-                yarn_factor = 64.0f;
-                std::printf("[draft]  auto-detected 35B draft — applying YaRN defaults\n");
-            }
-            if (yarn_factor > 1.0f) {
-                dw_.rope_freq_scale  = 1.0f / yarn_factor;
-                dw_.rope_ext_factor  = 1.0f;
-                dw_.rope_attn_factor = 1.0f;
-                dw_.rope_beta_fast   = cfg_.draft_yarn_beta_fast;
-                dw_.rope_beta_slow   = cfg_.draft_yarn_beta_slow;
-                dw_.rope_n_ctx_orig  = cfg_.draft_yarn_orig_ctx;
-                std::printf("[draft]  YaRN: factor=%.1f freq_scale=%.6f beta_fast=%.1f beta_slow=%.1f orig_ctx=%d\n",
-                            yarn_factor, dw_.rope_freq_scale,
-                            dw_.rope_beta_fast, dw_.rope_beta_slow, dw_.rope_n_ctx_orig);
-            }
-        }
-
         if (cfg_.draft_swa_window > 0) {
             dw_.swa_window = cfg_.draft_swa_window;
             for (int il = 0; il < dw_.n_layer - 1; il++)
@@ -851,11 +820,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
     }
 
     // AR decode loop for remaining tokens
-    double t_build_total = 0, t_compute_total = 0, t_logits_total = 0;
-    double t_get_total = 0, t_sample_total = 0;
-    int ar_steps = 0;
-    auto t_ar_start = std::chrono::steady_clock::now();
-
     for (int i = 1; i < n_gen; i++) {
         int32_t tok = out_tokens.back();
 
@@ -864,7 +828,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         int32_t pos4[4] = {committed, committed, committed, 0};
         ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
 
-        auto tb0 = std::chrono::steady_clock::now();
         if (!build_target_step(sg_, w_, cache_, target_backend_,
                                /*kv_start=*/committed, /*n_tokens=*/1,
                                /*with_mask=*/false, /*capture=*/false,
@@ -875,26 +838,14 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                should_capture_moe_router())) {
             return false;
         }
-        auto tb1 = std::chrono::steady_clock::now();
-        t_build_total += std::chrono::duration<double>(tb1 - tb0).count();
 
-        if (ar_steps == 0) {
-            std::fprintf(stderr, "[ar-graph] nodes=%d\n", ggml_graph_n_nodes(sg_.gf));
-        }
-
-        auto tc0 = std::chrono::steady_clock::now();
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
-        auto tc1 = std::chrono::steady_clock::now();
-        t_compute_total += std::chrono::duration<double>(tc1 - tc0).count();
 
         after_target_compute(sg_, committed, 1);
 
-        auto tl0 = std::chrono::steady_clock::now();
         ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
                                 sizeof(float) * vocab);
-        auto tg1 = std::chrono::steady_clock::now();
-        t_get_total += std::chrono::duration<double>(tg1 - tl0).count();
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
@@ -906,34 +857,14 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 if (logits_buf[j] > best) { best = logits_buf[j]; next_tok = j; }
             }
         }
-        auto tl1 = std::chrono::steady_clock::now();
-        t_sample_total += std::chrono::duration<double>(tl1 - tg1).count();
-        t_logits_total += std::chrono::duration<double>(tl1 - tl0).count();
 
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
         committed++;
         cache_.cur_pos = committed;
-        ar_steps++;
         if (io.cancelled) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
-    }
-
-    if (ar_steps > 0) {
-        double t_ar_total = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ar_start).count();
-        std::fprintf(stderr, "[ar-perf] steps=%d total=%.3fs speed=%.1f tok/s\n"
-                             "  build=%.3fs (%.1f%%) compute=%.3fs (%.1f%%) logits=%.3fs (%.1f%%)\n"
-                             "  per_tok: build=%.2fms compute=%.2fms logits=%.2fms (get=%.2fms sample=%.2fms)\n",
-                     ar_steps, t_ar_total, ar_steps / t_ar_total,
-                     t_build_total, 100.0 * t_build_total / t_ar_total,
-                     t_compute_total, 100.0 * t_compute_total / t_ar_total,
-                     t_logits_total, 100.0 * t_logits_total / t_ar_total,
-                     1000.0 * t_build_total / ar_steps,
-                     1000.0 * t_compute_total / ar_steps,
-                     1000.0 * t_logits_total / ar_steps,
-                     1000.0 * t_get_total / ar_steps,
-                     1000.0 * t_sample_total / ar_steps);
     }
     return true;
 }

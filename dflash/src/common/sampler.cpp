@@ -48,15 +48,14 @@ int sample_logits(const float * logits_in,
         }
     }
 
-    // Use effective top_k: if user didn't set top_k, use a sensible default
-    // to avoid O(n log n) sort on very large vocabularies (e.g. 248K).
-    const int effective_k = (cfg.top_k > 0 && cfg.top_k < vocab)
-                                ? cfg.top_k
-                                : std::min(vocab, 256);
-
-    std::partial_sort(cand.begin(), cand.begin() + effective_k, cand.end(),
-                      [](auto & a, auto & b){ return a.first > b.first; });
-    cand.resize(effective_k);
+    if (cfg.top_k > 0 && cfg.top_k < vocab) {
+        std::partial_sort(cand.begin(), cand.begin() + cfg.top_k, cand.end(),
+                          [](auto & a, auto & b){ return a.first > b.first; });
+        cand.resize(cfg.top_k);
+    } else {
+        std::sort(cand.begin(), cand.end(),
+                  [](auto & a, auto & b){ return a.first > b.first; });
+    }
 
     // temp=0 → deterministic argmax (after penalties have been applied above).
     if (cfg.temp <= 0.0f) {

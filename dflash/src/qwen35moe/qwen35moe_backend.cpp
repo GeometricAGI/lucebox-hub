@@ -516,7 +516,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             const auto t0 = HybridClock::now();
 
             StepGraph * sg_ptr;
-            if (false && !is_attn && prefn_built[(size_t)il]) {
+            if (!is_attn && prefn_built[(size_t)il]) {
                 sg_ptr = &cached_prefn[(size_t)il];
             } else {
                 StepGraph & sg = is_attn ? layer_sg : cached_prefn[(size_t)il];

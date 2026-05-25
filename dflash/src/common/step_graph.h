@@ -68,29 +68,6 @@ inline void step_graph_free(StepGraph & sg) {
     sg.moe_selected.clear();
 }
 
-// Soft reset: reuse the ggml_context buffer so tensor addresses are
-// deterministic across rebuilds.  This enables CUDA graph capture/replay
-// since the graph key (nodes[0] pointer) remains stable.
-inline void step_graph_soft_reset(StepGraph & sg) {
-    if (sg.ctx) {
-        ggml_reset(sg.ctx);
-    }
-    sg.gf = nullptr;
-    sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
-    sg.target_hidden_cat = sg.positions_k = nullptr;
-    sg.hidden_input = nullptr;
-    sg.parent_ids = nullptr;
-    sg.logits = nullptr;
-    sg.hidden_states = nullptr;
-    sg.argmax_tokens = nullptr;
-    sg.topk_indices = nullptr;
-    sg.ffn_residual = nullptr;
-    sg.ffn_post = nullptr;
-    sg.moe_weights = nullptr;
-    sg.delta_captures.clear();
-    sg.moe_selected.clear();
-}
-
 // Full cleanup: release the persistent gallocr + its CUDA buffer.
 inline void step_graph_destroy(StepGraph & sg) {
     if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
