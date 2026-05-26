@@ -16,15 +16,15 @@
 </p>
 
 <p align="center">
-  <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding, quantized GGUF paths.</strong><br/>
-  Each project is a new optimization to our engine for a specific model family and hardware target.
+  <strong>Local LLM inference server built for speed. Custom kernels, speculative prefill & decoding.</strong><br/>
+  Each optimization to our engine is for specific model family and hardware target.
 </p>
 
 ---
 
-## Projects
+## Optimizations
 
-Each directory is a self-contained project with setup instructions and benchmark notes.
+Each directory is self-contained with setup instructions and benchmark notes.
 
 <p align="center">
   <a href="optimizations/megakernel/"><img src="assets/svg/card-megakernel-dark.svg" alt="Megakernel" width="46%"></a>
