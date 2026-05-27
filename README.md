@@ -60,12 +60,12 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 </td>
 <td valign="top">
 
-| Drafter | Target (phase) |
-|---------|----------------|
-| [`Lucebox/Qwen3.6-27B-DFlash-GGUF`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | Qwen 3.6-27B (decode) |
-| [`Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | Gemma-4-26B-A4B (decode) |
-| [`Lucebox/gemma-4-31B-it-DFlash-GGUF`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | Gemma-4-31B (decode) |
-| [`Qwen/Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | any (prefill) |
+| Drafter | Phase |
+|---------|:-----:|
+| [`Qwen3.6-27B-DFlash`](https://huggingface.co/Lucebox/Qwen3.6-27B-DFlash-GGUF) | decode |
+| [`gemma-4-26B-A4B-DFlash`](https://huggingface.co/Lucebox/gemma-4-26B-A4B-it-DFlash-GGUF) | decode |
+| [`gemma-4-31B-DFlash`](https://huggingface.co/Lucebox/gemma-4-31B-it-DFlash-GGUF) | decode |
+| [`Qwen3-0.6B`](https://huggingface.co/Qwen/Qwen3-0.6B) | prefill |
 
 </td>
 </tr>
