@@ -55,22 +55,33 @@ All speedups measured vs vendored llama.cpp (`-fa 1`, matching KV quant). Combin
 
 ## Supported Harnesses
 
-<a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="320" /></a>
-
 [`harness/`](harness/) contains RTX 3090 client launchers and regression tests
 for Lucebox server compatibility. Run Lucebox inside Claude Code, Codex,
 OpenCode, Hermes, Pi, OpenClaw, or Open WebUI, or check if a server change
 still works with those clients.
 
+<table>
+<tr>
+<td width="50%" valign="middle">
+
+<a href="harness/"><img src="harness/assets/hero.png" alt="Lucebox client harness experiments on RTX 3090" width="100%" /></a>
+
+</td>
+<td width="50%" valign="middle">
+
 | Client | Launcher |
 |--------|----------|
-| Claude Code | [`harness/clients/run_claude_code.sh`](harness/clients/run_claude_code.sh) |
-| Codex | [`harness/clients/run_codex.sh`](harness/clients/run_codex.sh) |
-| OpenCode | [`harness/clients/run_opencode.sh`](harness/clients/run_opencode.sh) |
-| Hermes | [`harness/clients/run_hermes.sh`](harness/clients/run_hermes.sh) |
-| Pi | [`harness/clients/run_pi.sh`](harness/clients/run_pi.sh) |
-| OpenClaw | [`harness/clients/run_openclaw.sh`](harness/clients/run_openclaw.sh) |
-| Open WebUI | [`harness/clients/run_openwebui.sh`](harness/clients/run_openwebui.sh) |
+| Claude Code | [`run_claude_code.sh`](harness/clients/run_claude_code.sh) |
+| Codex | [`run_codex.sh`](harness/clients/run_codex.sh) |
+| OpenCode | [`run_opencode.sh`](harness/clients/run_opencode.sh) |
+| Hermes | [`run_hermes.sh`](harness/clients/run_hermes.sh) |
+| Pi | [`run_pi.sh`](harness/clients/run_pi.sh) |
+| OpenClaw | [`run_openclaw.sh`](harness/clients/run_openclaw.sh) |
+| Open WebUI | [`run_openwebui.sh`](harness/clients/run_openwebui.sh) |
+
+</td>
+</tr>
+</table>
 
 All launchers spawn the native C++ HTTP server (`dflash_server`). Override defaults via env vars:
 
