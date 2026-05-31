@@ -708,22 +708,43 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 }
             }
 
-            // Batched hybrid FFN for this chunk
+            // Hybrid FFN — skip batched path when cold experts exist (CUDA mul_mat_id bug on sm_75)
             MoeHybridConfig chunk_cfg = make_moe_hybrid_config(target_weights());
             MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
             std::vector<float> ffn_batch_out;
-            if (!eval_moe_hybrid_ffn_batched(
-                    target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
-                    chunk_post.data(),
-                    chunk_selected.data(),
-                    chunk_weights.data(),
-                    chunk_len, ffn_batch_out, &result.error,
-                    &ffn_hot_alloc, &ffn_cold_alloc)) {
-                step_graph_destroy(prefill_sg);
-                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
-                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
-                cleanup_graphs();
-                return result;
+            bool ffn_ok = false;
+            if (storage.cold_expert_ids.empty()) {
+                // All experts hot — safe to use batched path
+                ffn_ok = eval_moe_hybrid_ffn_batched(
+                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
+                        chunk_post.data(),
+                        chunk_selected.data(),
+                        chunk_weights.data(),
+                        chunk_len, ffn_batch_out, &result.error,
+                        &ffn_hot_alloc, &ffn_cold_alloc);
+            }
+            if (!ffn_ok) {
+                // Per-token fallback (avoids sm_75 mul_mat_id assertion with cold experts)
+                result.error.clear();
+                ffn_batch_out.assign((size_t)hidden * (size_t)chunk_len, 0.0f);
+                std::vector<float> single_out;
+                for (int ti = 0; ti < chunk_len; ++ti) {
+                    const float * tok_post = chunk_post.data() + (size_t)ti * (size_t)hidden;
+                    const int32_t * tok_sel = chunk_selected.data() + (size_t)ti * (size_t)n_expert_used;
+                    const float * tok_wts = chunk_weights.data() + (size_t)ti * (size_t)n_expert_used;
+                    if (!eval_moe_hybrid_ffn_single(
+                            target_backend(), chunk_cfg, chunk_desc, storage, cpu_be,
+                            tok_post, tok_sel, tok_wts, n_expert_used, single_out)) {
+                        result.error = "prefill_ffn_single";
+                        step_graph_destroy(prefill_sg);
+                        if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                        if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+                        cleanup_graphs();
+                        return result;
+                    }
+                    std::memcpy(ffn_batch_out.data() + (size_t)ti * (size_t)hidden,
+                                single_out.data(), sizeof(float) * (size_t)hidden);
+                }
             }
 
             // Combine FFN output + residual → embed_all for next layer
