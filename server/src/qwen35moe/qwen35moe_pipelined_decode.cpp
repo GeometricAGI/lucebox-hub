@@ -185,6 +185,39 @@ bool init_pipelined_decode_state(
                  cached_prefn_count, routed_count,
                  out.cold_compute ? "" : " (drop_cold=lossy)");
 
+    // Initialize fused cold FFN compute (bypasses ggml graph dispatch)
+    if (out.cold_compute) {
+        out.cold_ffn_compute = make_cpu_cold_ffn_compute(w.n_ff_exp);
+        out.cold_ffn_layers.resize((size_t)w.n_layer);
+        out.cold_output_buf.resize((size_t)w.n_embd);
+        for (int il = 0; il < w.n_layer && (size_t)il < hybrid.layers.size(); ++il) {
+            auto & storage = hybrid.layers[(size_t)il];
+            const TargetLayer & L = w.layers[(size_t)il];
+            auto & cl = out.cold_ffn_layers[(size_t)il];
+            cl.fused_gate_up = (storage.gate_up_cold != nullptr);
+            if (cl.fused_gate_up) {
+                cl.gate_up_data = storage.gate_up_cold ? storage.gate_up_cold->data : nullptr;
+                cl.gate_up_stride = storage.gate_up_cold ? storage.gate_up_cold->nb[2] : 0;
+                cl.gate_up_type = storage.gate_up_cold ? storage.gate_up_cold->type : GGML_TYPE_Q4_K;
+                cl.gate_up_scale = L.ffn_gate_up_exps_s;
+            } else {
+                cl.gate_data = storage.gate_cold ? storage.gate_cold->data : nullptr;
+                cl.up_data = storage.up_cold ? storage.up_cold->data : nullptr;
+                cl.gate_stride = storage.gate_cold ? storage.gate_cold->nb[2] : 0;
+                cl.up_stride = storage.up_cold ? storage.up_cold->nb[2] : 0;
+                cl.gate_type = storage.gate_cold ? storage.gate_cold->type : GGML_TYPE_Q4_K;
+                cl.up_type = storage.up_cold ? storage.up_cold->type : GGML_TYPE_Q4_K;
+                cl.gate_scale = L.ffn_gate_exps_s;
+                cl.up_scale = L.ffn_up_exps_s;
+            }
+            cl.down_data = storage.down_cold ? storage.down_cold->data : nullptr;
+            cl.down_stride = storage.down_cold ? storage.down_cold->nb[2] : 0;
+            cl.down_type = storage.down_cold ? storage.down_cold->type : GGML_TYPE_Q4_K;
+            cl.down_scale = L.ffn_down_exps_s;
+        }
+        std::fprintf(stderr, "[pipelined] cold FFN: fused kernel (bypasses ggml graph)\n");
+    }
+
     out.cold_in_zeroed = true;
     return true;
 }
@@ -537,31 +570,42 @@ bool pipelined_decode_one_token(
         const auto cold_t0 = PipelineClock::now();
         if (has_cold) {
             // ffn_post already read above (before hot launch) — no GPU sync here!
-            if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
-                build_cached_cold_graph(storage.cold_graph, cpu_be,
-                                        storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
-                                        L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
-                                        n_embd, w.n_ff_exp, n_cold);
-            }
-            if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
-                ggml_backend_tensor_set(storage.cold_graph.inp, state.ffn_post_host_buf.data(), 0,
-                                        sizeof(float) * (size_t)n_embd);
-                ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids, 0,
-                                        sizeof(int32_t) * (size_t)n_cold);
-                ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights, 0,
-                                        sizeof(float) * (size_t)n_cold);
-                // CPU cold compute — hot GPU runs concurrently on its stream
-                const auto cold_compute_t0 = PipelineClock::now();
-                auto cst = ggml_backend_graph_compute(cpu_be, storage.cold_graph.gf);
-                if (tel) tel->cold_compute_us += pipe_elapsed_us(cold_compute_t0, PipelineClock::now());
-                if (cst != GGML_STATUS_SUCCESS) {
+            const auto cold_compute_t0 = PipelineClock::now();
+            if (state.cold_ffn_compute) {
+                // Fused kernel: bypass ggml graph dispatch entirely
+                state.cold_ffn_compute->compute(
+                    state.cold_ffn_layers[(size_t)il],
+                    state.ffn_post_host_buf.data(),
+                    cold_ids,
+                    cold_weights,
+                    n_cold, n_embd, w.n_ff_exp,
+                    state.cold_output_buf.data());
+            } else {
+                // Fallback: ggml cold graph (legacy path)
+                if (!storage.cold_graph.valid() || storage.cold_graph.n_hot != n_cold) {
+                    build_cached_cold_graph(storage.cold_graph, cpu_be,
+                                            storage.gate_cold, storage.up_cold, storage.down_cold, storage.gate_up_cold,
+                                            L.ffn_gate_exps_s, L.ffn_up_exps_s, L.ffn_down_exps_s, L.ffn_gate_up_exps_s,
+                                            n_embd, w.n_ff_exp, n_cold);
+                }
+                if (storage.cold_graph.valid() && storage.cold_graph.n_hot == n_cold) {
+                    ggml_backend_tensor_set(storage.cold_graph.inp, state.ffn_post_host_buf.data(), 0,
+                                            sizeof(float) * (size_t)n_embd);
+                    ggml_backend_tensor_set(storage.cold_graph.ids, cold_ids, 0,
+                                            sizeof(int32_t) * (size_t)n_cold);
+                    ggml_backend_tensor_set(storage.cold_graph.weights, cold_weights, 0,
+                                            sizeof(float) * (size_t)n_cold);
+                    auto cst = ggml_backend_graph_compute(cpu_be, storage.cold_graph.gf);
+                    if (cst != GGML_STATUS_SUCCESS) {
+                        if (hot_async_launched) ggml_backend_synchronize(backend);
+                        return false;
+                    }
+                } else {
                     if (hot_async_launched) ggml_backend_synchronize(backend);
                     return false;
                 }
-            } else {
-                if (hot_async_launched) ggml_backend_synchronize(backend);
-                return false;
             }
+            if (tel) tel->cold_compute_us += pipe_elapsed_us(cold_compute_t0, PipelineClock::now());
         }
         if (tel) tel->cold_cpu_us += pipe_elapsed_us(cold_t0, PipelineClock::now());
 
@@ -577,9 +621,16 @@ bool pipelined_decode_one_token(
         }
 
         if (has_cold) {
-            ggml_backend_tensor_get(storage.cold_graph.output, state.ffn_post_host_buf.data(), 0,
-                                    sizeof(float) * (size_t)n_embd);
-            ggml_backend_tensor_set_async(backend, state.gpu_state.combine.cold_in, state.ffn_post_host_buf.data(), 0,
+            const float * cold_result = state.cold_ffn_compute
+                ? state.cold_output_buf.data()
+                : nullptr;
+            if (!cold_result) {
+                // Legacy path: read from ggml tensor
+                ggml_backend_tensor_get(storage.cold_graph.output, state.ffn_post_host_buf.data(), 0,
+                                        sizeof(float) * (size_t)n_embd);
+                cold_result = state.ffn_post_host_buf.data();
+            }
+            ggml_backend_tensor_set_async(backend, state.gpu_state.combine.cold_in, cold_result, 0,
                                            sizeof(float) * (size_t)n_embd);
             state.cold_in_zeroed = false;
         } else if (!state.cold_in_zeroed) {

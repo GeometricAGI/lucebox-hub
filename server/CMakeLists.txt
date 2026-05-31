@@ -256,6 +256,7 @@ add_library(dflash_common STATIC
     src/common/moe_hybrid_routing_stats.cpp
     src/common/moe_hybrid_storage.cpp
     src/common/moe_hybrid_ffn_eval.cpp
+    src/common/cold_ffn_cpu.cpp
     src/common/moe_hybrid_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
     src/qwen35/layer_split_daemon.cpp
@@ -523,6 +524,11 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
 )
+# OpenMP for parallel cold FFN kernel (saturate memory bandwidth).
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(dflash_common PRIVATE OpenMP::OpenMP_CXX)
+endif()
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_link_libraries(dflash_common PRIVATE hip::host)
 endif()

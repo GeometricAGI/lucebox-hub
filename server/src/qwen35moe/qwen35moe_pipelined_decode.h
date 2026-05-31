@@ -12,11 +12,13 @@
 #include "internal.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/cold_ffn_compute.h"
 #include "graph_builders.h"
 
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace dflash::common {
@@ -117,6 +119,11 @@ struct PipelinedDecodeState {
     // Set DFLASH_DROP_COLD=1 to disable (fast but lossy).
     bool cold_compute = true;
 
+    // Fused cold FFN compute (bypasses ggml graph dispatch overhead)
+    std::unique_ptr<ColdFfnCompute> cold_ffn_compute;
+    std::vector<ColdFfnLayer> cold_ffn_layers;   // per-layer cold weight metadata
+    std::vector<float> cold_output_buf;           // [n_embd] scratch for cold FFN output
+
     // Tracking
     int n_layer = 0;
     int n_embd = 0;
@@ -136,6 +143,9 @@ struct PipelinedDecodeState {
           ffn_post_host_buf(std::move(o.ffn_post_host_buf)),
           cold_in_zeroed(o.cold_in_zeroed),
           cold_compute(o.cold_compute),
+          cold_ffn_compute(std::move(o.cold_ffn_compute)),
+          cold_ffn_layers(std::move(o.cold_ffn_layers)),
+          cold_output_buf(std::move(o.cold_output_buf)),
           n_layer(o.n_layer), n_embd(o.n_embd),
           n_expert_used(o.n_expert_used),
           full_attention_interval(o.full_attention_interval) {
@@ -152,6 +162,9 @@ struct PipelinedDecodeState {
             ffn_post_host_buf = std::move(o.ffn_post_host_buf);
             cold_in_zeroed = o.cold_in_zeroed;
             cold_compute = o.cold_compute;
+            cold_ffn_compute = std::move(o.cold_ffn_compute);
+            cold_ffn_layers = std::move(o.cold_ffn_layers);
+            cold_output_buf = std::move(o.cold_output_buf);
             n_layer = o.n_layer; n_embd = o.n_embd;
             n_expert_used = o.n_expert_used;
             full_attention_interval = o.full_attention_interval;
