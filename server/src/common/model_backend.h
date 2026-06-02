@@ -166,7 +166,9 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] spec-decode produced zero tokens; retrying with AR decode\n");
+            "[backend] spec-decode produced zero tokens after %.3f s decode; "
+            "retrying with AR decode\n",
+            result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result, generate(retry, io));
@@ -194,7 +196,9 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] restored spec-decode produced zero tokens; retrying with AR decode\n");
+            "[backend] restored spec-decode slot=%d produced zero tokens after "
+            "%.3f s decode; retrying with AR decode\n",
+            slot, result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result,

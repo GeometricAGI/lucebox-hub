@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <sys/stat.h>
 
 namespace dflash::common {
 
@@ -39,10 +40,12 @@ static bool tokens_contain_recent_sequence(const std::vector<int32_t> & tokens,
                                            const std::vector<int32_t> & needle,
                                            size_t max_trailing) {
     if (needle.empty() || tokens.size() < needle.size()) return false;
-    const size_t last_start = tokens.size() - needle.size();
-    const size_t first_start =
-        last_start > max_trailing ? last_start - max_trailing : 0;
-    for (size_t start = first_start; start <= last_start; ++start) {
+    const size_t last_end = tokens.size();
+    const size_t first_end = std::max(
+        needle.size(),
+        last_end > max_trailing ? last_end - max_trailing : needle.size());
+    for (size_t end = first_end; end <= last_end; ++end) {
+        const size_t start = end - needle.size();
         if (std::equal(needle.begin(), needle.end(), tokens.begin() + start)) {
             return true;
         }
@@ -69,6 +72,23 @@ static int env_int_or_default(const char * name, int fallback) {
         if (*raw) return std::atoi(raw);
     }
     return fallback;
+}
+
+static int dflash_min_tokens_floor() {
+    static const int value = env_int_or_default("DFLASH_MIN_TOKENS", 0);
+    return value;
+}
+
+static FILE * open_dflash_floor_log() {
+    static constexpr const char * kPath = "/tmp/dflash_floor.log";
+    static constexpr off_t kMaxBytes = 1024 * 1024;
+
+    struct stat st;
+    if (::stat(kPath, &st) == 0 && st.st_size > kMaxBytes) {
+        FILE * reset = std::fopen(kPath, "w");
+        if (reset) std::fclose(reset);
+    }
+    return std::fopen(kPath, "a");
 }
 }  // namespace
 
@@ -986,12 +1006,12 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
     const size_t out_tokens_at_entry = out_tokens.size();
-    static const int _min_floor = env_int_or_default("DFLASH_MIN_TOKENS", 0);
+    const int _min_floor = dflash_min_tokens_floor();
     static const int _repeat_guard = []{
         const int explicit_guard =
             env_int_or_default("DFLASH_DEGENERATE_RUN_TOKENS", -1);
         if (explicit_guard >= 0) return explicit_guard;
-        return env_int_or_default("DFLASH_MIN_TOKENS", 0) > 0 ? 32 : 0;
+        return dflash_min_tokens_floor() > 0 ? 32 : 0;
     }();
 
     const int hidden = w_.n_embd;
@@ -1086,10 +1106,9 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                 if (alt >= 0) {
                     // Debug-only diagnostic: writes happen exclusively when the
                     // operator opts into DFLASH_MIN_TOKENS, so the default
-                    // production lane never touches /tmp/dflash_floor.log. When
-                    // enabled for a debugging session, treat it as append-only
-                    // and rotate/clear out of band.
-                    FILE* _d = std::fopen("/tmp/dflash_floor.log", "a");
+                    // production lane never touches /tmp/dflash_floor.log.
+                    // Bound the local evidence file before appending.
+                    FILE* _d = open_dflash_floor_log();
                     if (_d) { std::fprintf(_d, "[floor] eos@%d -> alt=%d\n", (int)out_tokens.size(), alt); std::fclose(_d); }
                     next_tok = alt;
                 }
@@ -1253,7 +1272,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     }
 
     out_spec_ran = true;
-    static const int _min_floor = env_int_or_default("DFLASH_MIN_TOKENS", 0);
+    const int _min_floor = dflash_min_tokens_floor();
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
@@ -1503,7 +1522,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 // Action preambles often end as "I'll check:\n\n" before EOS.
                 // Tokenization makes the colon several tokens back, so keep a
                 // modest trailing window while still requiring a recent action
-                // suffix and no nearby completion phrase.
+                // suffix token and no nearby completion phrase.
                 const bool can_inject_tool =
                     stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
                     stall_action_suffix_tokens && !stall_action_suffix_tokens->empty() &&
@@ -1516,7 +1535,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 if (can_inject_tool) {
                     // Debug-only diagnostic, same DFLASH_MIN_TOKENS gating as the
                     // AR-path floor log above; silent in the default lane.
-                    FILE* _d = std::fopen("/tmp/dflash_floor.log", "a");
+                    FILE* _d = open_dflash_floor_log();
                     if (_d) {
                         std::fprintf(_d,
                             "[spec-tool-floor] eos@%d committed=%d emitted=%d prefix=%zu -> ar\n",
