@@ -11,10 +11,35 @@ dependencies = [
     "lucebox-dflash",
     "pflash",
 ]
+# Note: `lucebox`, `luce-bench`, and `harness` packages land in sibling
+# PRs (#335 lucebox-cli, #337 luce-bench). This PR ships the docker stack
+# as a foundational layer; #335/#337 add their workspace members back
+# into this list when they merge.
 
 [project.optional-dependencies]
 megakernel = ["qwen35-megakernel-bf16"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mypy>=1.10,<2", "ruff>=0.14,<1"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Staged lint adoption for the Python surfaces touched by the Docker,
+# benchmark, autotune, and host-CLI stack. Untouched server-adjacent scripts and
+# vendored dependencies stay outside this gate until they are cleaned up.
+#
+# The lucebox/**/*.py include is re-added by #335 (lucebox-cli) when that
+# package lands; #334 (this PR) ships only the docker stack, so there is
+# nothing to lint at the root yet. The `pyproject.toml`-driven ruff config
+# still applies to whatever members add their own include lists.
+include = []
+extend-exclude = [
+    "dflash/deps",
+    "megakernel",
+    "pflash",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
 
 [tool.uv]
 package = false
@@ -31,6 +56,11 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
+# `lucebox`, `luce-bench`, and `harness` workspace members land in sibling
+# PRs (#335 lucebox-cli, #337 luce-bench). Keeping them out of `members`
+# here lets `uv lock --check` / `uv sync --frozen` pass on this branch
+# alone; #335 and #337 each re-add their own member entry as part of
+# their PR diff.
 members = ["server", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
@@ -43,3 +73,8 @@ torch = { index = "pytorch-cu128" }
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
