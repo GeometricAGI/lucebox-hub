@@ -170,6 +170,37 @@ Run it directly:
   --model-name luce-dflash
 ```
 
+### Compression proxy mode
+
+`dflash_server` can run as a **PFlash compression proxy** in front of any
+OpenAI-compatible backend instead of doing local inference. When
+`--prefill-upstream-base` is set, each request is compressed (PFlash) and
+forwarded upstream: compressed requests are sent as a raw `prompt` to
+`<base>/v1/completions` (the compressed text already carries chat-template
+markup, so this avoids double-templating), while uncompressed requests pass
+through to `<base>/v1/chat/completions`. Streaming and non-streaming responses
+are rewritten back to the Chat Completions shape. With no upstream flags the
+server is byte-identical to local-inference mode.
+
+```bash
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+  --prefill-compression auto --prefill-threshold 10000 \
+  --prefill-drafter models/Qwen3-0.6B-BF16.gguf \
+  --prefill-curve 10000:0.5 40000:0.2 100000:0.1 \
+  --prefill-upstream-base http://127.0.0.1:8099 \
+  --prefill-upstream-model my-upstream-model \
+  --port 8080
+```
+
+New PFlash flags:
+
+| Flag | Purpose |
+|---|---|
+| `--prefill-curve T:R [T:R ...]` | Piecewise keep-ratio curve. Linear interpolation over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression at 10K tokens, 5× at 40K, 10× at 100K+). Overrides `--prefill-keep-ratio`; a per-session bandit override still takes precedence. |
+| `--prefill-upstream-base <URL>` | OpenAI-compatible upstream base URL. Enables proxy mode. |
+| `--prefill-upstream-key <KEY>` | Bearer token sent to the upstream. |
+| `--prefill-upstream-model <NAME>` | Model name sent on forwarded requests. |
+
 Then point OpenAI-compatible clients at `http://127.0.0.1:18080/v1`, or probe
 the server with:
 
