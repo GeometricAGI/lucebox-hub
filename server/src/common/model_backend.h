@@ -100,6 +100,12 @@ struct GenerateRequest {
     // When non-null, the spec decode loop uses these as draft overrides,
     // bypassing draft model computation for covered positions.
     const std::vector<int32_t> * hint_tokens = nullptr;
+    // Optional env-gated dflash stall recovery: when spec decode is about to
+    // emit early EOS after an action preamble, inject a bare tool-call XML
+    // prefix and continue in AR with KV state intact.
+    const std::vector<int32_t> * stall_tool_prefix_tokens = nullptr;
+    const std::vector<int32_t> * stall_action_suffix_tokens = nullptr;
+    const std::vector<int32_t> * stall_skip_tokens = nullptr;
     // Optional thinking-budget hook — see BudgetHook docs above.
     BudgetHook                 budget_hook;
     // Common retry knob. Upper layers set this after a speculative decode
@@ -162,7 +168,9 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] spec-decode produced no visible output; retrying with AR decode\n");
+            "[backend] spec-decode produced zero tokens after %.3f s decode; "
+            "retrying with AR decode\n",
+            result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result, generate_impl(retry, io));
@@ -189,7 +197,9 @@ struct ModelBackend {
         if (!should_retry_empty_spec_decode(req, result)) return result;
 
         std::fprintf(stderr,
-            "[backend] restored spec-decode produced no visible output; retrying with AR decode\n");
+            "[backend] restored spec-decode slot=%d produced zero tokens after "
+            "%.3f s decode; retrying with AR decode\n",
+            slot, result.decode_s);
         GenerateRequest retry = req;
         retry.force_ar_decode = true;
         return merge_empty_spec_retry_result(result,
