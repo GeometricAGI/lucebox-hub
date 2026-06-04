@@ -1485,6 +1485,8 @@ static void test_layer_split_backend_sampling_capability_gate() {
         TEST_ASSERT(result.tokens.size() == 1);
         TEST_ASSERT(result.tokens[0] == 12);
     }
+}
+
 static void test_layer_split_backend_chunks_prefill_by_adapter_limit() {
     auto * raw = new MockLayerSplitAdapter();
     raw->prefill_chunk = 3;
