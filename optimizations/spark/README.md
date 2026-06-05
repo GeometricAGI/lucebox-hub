@@ -115,7 +115,8 @@ profile is written, reloaded (`source=hotness:...`), and generation stays
 coherent under offload.
 
 The offline pipeline below is for **bootstrapping** a profile before first serve
-(e.g. from your own Claude Code sessions) and for **evaluation**. It is optional.
+(e.g. from your own Claude Code and Codex session history) and for
+**evaluation**. It is optional.
 
 ## Bootstrapping / eval pipeline
 
@@ -129,8 +130,10 @@ uv sync                                   # tokenizers (+ gguf/torch optional ex
 # 0. one tokenizer, extracted from the GGUF (gpt2 byte-level BPE)
 python -m spark.tokenizer --gguf laguna-xs2-Q4_K_M.gguf --out laguna_tok.json
 
-# 1. corpus from your agent sessions (train / held-out split, by session)
-python -m spark.extract_sessions --sessions-dir ~/.claude/projects --out-dir ./corpus
+# 1. corpus from your agent sessions, by session split. Pulls Claude Code
+#    (~/.claude/projects) and Codex (~/.codex/sessions) by default; --source
+#    claude|codex|both to pick.
+python -m spark.extract_sessions --source both --out-dir ./corpus
 
 # 2. calibrate the placement profile (routing is placement-independent, so a
 #    high budget calibrates fast)
