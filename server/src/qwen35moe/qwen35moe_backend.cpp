@@ -217,6 +217,90 @@ void Qwen35MoeBackend::after_target_compute(StepGraph & sg, int, int) {
     }
 }
 
+bool Qwen35MoeBackend::spark_wants_bootstrap() const {
+    return routing_stats_ && !layer_expert_bytes_.empty() && spark_expert_budget_ > 0;
+}
+
+// Re-mmap the GGUF and rebuild the hot/cold storage for a new placement. Used by
+// the Spark bootstrap to apply the calibrated placement in-process.
+bool Qwen35MoeBackend::rebuild_hybrid_from_placement(const MoeHybridPlacement & placement,
+                                                     std::string & err) {
+    TargetWeights & out = target_weights();
+    ggml_backend_t backend = target_backend();
+
+    gguf_init_params gip{};
+    gguf_context * gctx = gguf_init_from_file(cfg_.target_path, gip);
+    if (!gctx) { err = "gguf reinit failed"; return false; }
+    int fd = ::open(cfg_.target_path, O_RDONLY);
+    if (fd < 0) { gguf_free(gctx); err = "open failed"; return false; }
+    struct stat st;
+    if (::fstat(fd, &st) < 0) { ::close(fd); gguf_free(gctx); err = "fstat failed"; return false; }
+    const size_t file_size = (size_t)st.st_size;
+    void * mmap_addr = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (mmap_addr == MAP_FAILED) { gguf_free(gctx); err = "mmap failed"; return false; }
+
+    const size_t data_start = gguf_get_data_offset(gctx);
+    const auto * file_bytes = (const uint8_t *)mmap_addr;
+    std::vector<LayerExpertFileData> layer_file_data((size_t)out.n_layer);
+    for (int il = 0; il < out.n_layer; ++il) {
+        char name[128];
+        auto find_tensor_data = [&](const char * suffix) -> ExpertTensorFileData {
+            std::snprintf(name, sizeof(name), "blk.%d.%s.weight", il, suffix);
+            int64_t tid = gguf_find_tensor(gctx, name);
+            if (tid < 0) return {};
+            size_t off = data_start + gguf_get_tensor_offset(gctx, tid);
+            size_t sz = gguf_get_tensor_size(gctx, tid);
+            if (off + sz > file_size) return {};
+            return { file_bytes + off, sz };
+        };
+        layer_file_data[(size_t)il].gate_exps    = find_tensor_data("ffn_gate_exps");
+        layer_file_data[(size_t)il].up_exps      = find_tensor_data("ffn_up_exps");
+        layer_file_data[(size_t)il].down_exps    = find_tensor_data("ffn_down_exps");
+        layer_file_data[(size_t)il].gate_up_exps = find_tensor_data("ffn_gate_up_exps");
+    }
+
+    // Free the current hot/cold buffers before allocating the new ones so the
+    // rebuild fits in VRAM (no transient 2x). Safe: bootstrap runs at startup
+    // with no in-flight requests, and the budget is unchanged so the build that
+    // succeeded at init succeeds again.
+    out.moe_hybrid.reset();
+
+    auto hybrid = std::make_shared<MoeHybridStorage>();
+    MoeHybridConfig hybrid_cfg = make_moe_hybrid_config(out);
+    std::vector<MoeLayerDesc> layer_descs((size_t)out.n_layer);
+    for (int il = 0; il < out.n_layer; ++il)
+        layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
+    const int cache_slots = cache_slots_ >= 0 ? cache_slots_ : 0;
+
+    const bool ok = build_moe_hybrid_storage_from_file(hybrid_cfg, backend, placement, layer_descs,
+                                                       layer_file_data, *hybrid, &err, cache_slots);
+    ::munmap(mmap_addr, file_size);
+    gguf_free(gctx);
+    if (!ok) return false;
+    out.moe_hybrid = std::move(hybrid);
+    return true;
+}
+
+bool Qwen35MoeBackend::spark_bootstrap_finalize(const std::string & profile_path) {
+    if (!spark_wants_bootstrap()) return false;
+    std::string err;
+    routing_stats_->save_csv(profile_path, &err);  // persist the observed routing
+    const TargetWeights & w = target_weights();
+    MoeHybridPlacement placement;
+    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
+            *routing_stats_, layer_expert_bytes_, spark_expert_budget_,
+            std::min(w.n_expert_used, w.n_expert), placement, &err)) {
+        std::fprintf(stderr, "[spark] bootstrap placement build failed: %s\n", err.c_str());
+        return false;
+    }
+    if (!rebuild_hybrid_from_placement(placement, err)) {
+        std::fprintf(stderr, "[spark] bootstrap storage rebuild failed: %s\n", err.c_str());
+        return false;
+    }
+    return true;
+}
+
 void Qwen35MoeBackend::maybe_post_request_swap() {
     if (!routing_stats_) return;
 
@@ -1508,6 +1592,10 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
         if (err) *err = "no VRAM budget available for experts (GPU too small or context too long)";
         return false;
     }
+
+    // Stash for the Spark bootstrap rebuild (same budget + cache as this init).
+    spark_expert_budget_ = expert_budget;
+    layer_expert_bytes_  = layer_expert_bytes;
 
     // Build placement using greedy knapsack with byte budget
     if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
