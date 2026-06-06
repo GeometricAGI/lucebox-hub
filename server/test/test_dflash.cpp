@@ -3728,7 +3728,16 @@ int main(int argc, char ** argv) {
                 const int win_start_v = (verify_fa_window > 0 && committed > verify_fa_window)
                                             ? (committed - verify_fa_window) : 0;
                 const int win_len_v = committed + q_len - win_start_v;
-                build_causal_mask(mask_buf, win_len_v, q_len, committed, g_kq_stride_pad, win_start_v);
+                // Stride the mask to the SAME kv_pad the mask tensor was
+                // allocated with (align_up(max_ctx + n_tokens)). Without this
+                // override build_causal_mask strides rows by align_up(win_len),
+                // so only query row 0 lands at the right offset and rows 1.. read
+                // an unwritten region, giving NaN/zero attention (and logits)
+                // for every verify position > 0. That is also why the GPU
+                // argmax (sg.argmax_tokens) used to return -1 past position 0.
+                // DDTree already passes this override; chain did not.
+                build_causal_mask(mask_buf, win_len_v, q_len, committed, g_kq_stride_pad, win_start_v,
+                                  align_up(cache.max_ctx + q_len, g_kq_stride_pad));
             }
             ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             T_verify_set = sync_us();
@@ -3982,7 +3991,10 @@ int main(int argc, char ** argv) {
                 const int win_start_r = (replay_fa_window > 0 && committed > replay_fa_window)
                                             ? (committed - replay_fa_window) : 0;
                 const int win_len_r = committed + commit_n - win_start_r;
-                build_causal_mask(mask_buf, win_len_r, commit_n, committed, g_kq_stride_pad, win_start_r);
+                // Same kv_pad override as the verify mask above: match the mask
+                // tensor's allocated stride or only replay row 0 is valid.
+                build_causal_mask(mask_buf, win_len_r, commit_n, committed, g_kq_stride_pad, win_start_r,
+                                  align_up(cache.max_ctx + commit_n, g_kq_stride_pad));
                 ggml_backend_tensor_set(sg.attn_mask, mask_buf.data(), 0, sizeof(uint16_t) * mask_buf.size());
             }
             auto T_replay_set = sync_us();
