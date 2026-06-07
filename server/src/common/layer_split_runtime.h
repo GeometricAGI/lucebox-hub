@@ -29,9 +29,10 @@ template <typename Shard>
 bool init_layer_split_runtime(const LayerSplitRuntimeInit & cfg,
                               std::vector<Shard> & shards,
                               std::vector<ggml_backend_t> & snapshot_backends) {
+    const char * log_prefix = cfg.log_prefix ? cfg.log_prefix : "target-split";
     if (!cfg.target_path || !cfg.device ||
         cfg.device->layer_split_gpus.size() < 2) {
-        std::fprintf(stderr, "[%s] invalid layer-split config\n", cfg.log_prefix);
+        std::fprintf(stderr, "[%s] invalid layer-split config\n", log_prefix);
         return false;
     }
 
@@ -39,7 +40,7 @@ bool init_layer_split_runtime(const LayerSplitRuntimeInit & cfg,
     const int n_layer = info.n_layer;
     if (n_layer <= 0) {
         std::fprintf(stderr, "[%s] failed to inspect target layer count\n",
-                     cfg.log_prefix);
+                     log_prefix);
         return false;
     }
 
@@ -50,7 +51,7 @@ bool init_layer_split_runtime(const LayerSplitRuntimeInit & cfg,
     if (ranges.size() != cfg.device->layer_split_gpus.size()) {
         std::fprintf(stderr,
             "[%s] bad layer split for %zu GPUs and %d layers\n",
-            cfg.log_prefix, cfg.device->layer_split_gpus.size(), n_layer);
+            log_prefix, cfg.device->layer_split_gpus.size(), n_layer);
         return false;
     }
 
@@ -58,15 +59,18 @@ bool init_layer_split_runtime(const LayerSplitRuntimeInit & cfg,
     auto shard_metas = layer_split_shard_metas(shards);
     if (!init_layer_split_shard_metas(
             shard_metas, cfg.device->layer_split_gpus, ranges,
-            cfg.log_prefix)) {
+            log_prefix)) {
         return false;
+    }
+    for (size_t i = 0; i < shard_metas.size(); ++i) {
+        shard_metas[i]->placement_backend = cfg.device->layer_split_backend(i);
     }
 
     (void)enable_layer_split_peer_access(
         cfg.device->layer_split_gpus, cfg.device->peer_access);
 
     return init_layer_split_snapshot_backends(
-        shard_metas, snapshot_backends, cfg.log_prefix);
+        shard_metas, snapshot_backends, log_prefix);
 }
 
 using LayerSplitForwardStep = std::function<bool(

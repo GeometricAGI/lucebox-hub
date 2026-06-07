@@ -7,6 +7,7 @@
 #include "common/layer_split_utils.h"
 #include "common/sampler.h"
 #include "common/layer_split_runtime.h"
+#include "common/snapshot_backend.h"
 #include "qwen35/layer_split_forward.h"
 #include "qwen35/qwen35_layer_split_dflash_target.h"
 #include "qwen3/qwen3_drafter.h"
@@ -26,6 +27,10 @@ Qwen35LayerSplitAdapter::Qwen35LayerSplitAdapter(
 Qwen35LayerSplitAdapter::~Qwen35LayerSplitAdapter() { shutdown(); }
 
 bool Qwen35LayerSplitAdapter::init() {
+    if (cfg_.device.is_mixed_layer_split()) {
+        return init_mixed_target_split();
+    }
+
     const LayerSplitRuntimeInit runtime_cfg{
         cfg_.target_path,
         &cfg_.device,
@@ -64,6 +69,143 @@ bool Qwen35LayerSplitAdapter::init() {
     snapshot_prefill_logits_.resize(PREFIX_SLOTS);
     draft_feature_snapshots_.resize(PREFIX_SLOTS);
 
+    return true;
+}
+
+bool Qwen35LayerSplitAdapter::init_mixed_target_split() {
+    if (!cfg_.remote_target_shard.enabled() ||
+        cfg_.device.layer_split_gpus.size() < 2) {
+        std::fprintf(stderr,
+            "[target-split] mixed target split requires at least two shards and "
+            "remote target shard IPC\n");
+        return false;
+    }
+    if (cfg_.device.layer_split_backend(0) != compiled_placement_backend()) {
+        std::fprintf(stderr,
+            "[target-split] first mixed shard must match compiled backend\n");
+        return false;
+    }
+    size_t remote_begin = 0;
+    while (remote_begin < cfg_.device.layer_split_gpus.size() &&
+           cfg_.device.layer_split_backend(remote_begin) == compiled_placement_backend()) {
+        ++remote_begin;
+    }
+    if (remote_begin == 0 || remote_begin >= cfg_.device.layer_split_gpus.size()) {
+        std::fprintf(stderr,
+            "[target-split] mixed target split requires one local backend group "
+            "followed by one remote backend group\n");
+        return false;
+    }
+    const PlacementBackend remote_backend = cfg_.device.layer_split_backend(remote_begin);
+    for (size_t i = remote_begin; i < cfg_.device.layer_split_gpus.size(); ++i) {
+        if (cfg_.device.layer_split_backend(i) != remote_backend) {
+            std::fprintf(stderr,
+                "[target-split] mixed target split supports one backend boundary only\n");
+            return false;
+        }
+    }
+
+    const auto info = inspect_gguf_model_info(cfg_.target_path);
+    const int n_layer = info.n_layer;
+    if (n_layer <= 0) {
+        std::fprintf(stderr, "[target-split] failed to inspect target layer count\n");
+        return false;
+    }
+    const auto ranges = compute_layer_ranges(
+        n_layer, (int)cfg_.device.layer_split_gpus.size(),
+        cfg_.device.layer_split_weights);
+    if (ranges.size() != cfg_.device.layer_split_gpus.size()) {
+        std::fprintf(stderr,
+            "[target-split] bad mixed layer split for %zu GPUs and %d layers\n",
+            cfg_.device.layer_split_gpus.size(), n_layer);
+        return false;
+    }
+
+    shards_.resize(remote_begin);
+    for (size_t i = 0; i < remote_begin; ++i) {
+        Qwen35LayerSplitShard & local = shards_[i];
+        local.placement_backend = cfg_.device.layer_split_backend(i);
+        local.gpu = cfg_.device.layer_split_gpus[i];
+        local.layer_begin = ranges[i].begin;
+        local.layer_end = ranges[i].end;
+        local.backend = ggml_backend_cuda_init(local.gpu);
+        if (!local.backend) {
+            std::fprintf(stderr, "[target-split] local backend init failed gpu=%d\n",
+                         local.gpu);
+            return false;
+        }
+    }
+
+    for (auto & local : shards_) {
+        const TargetLoadPlan local_plan =
+            make_layer_split_load_plan<TargetLoadPlan>(local, /*is_last_shard=*/false);
+        if (!load_target_gguf_partial(cfg_.target_path, local.backend, local_plan,
+                                      local.weights) ||
+            !create_target_cache_partial(local.weights, cfg_.device.max_ctx,
+                                         cfg_.max_verify_tokens, local.backend,
+                                         local.cache,
+                                         /*prefill_only=*/!cfg_.run_dflash,
+                                         local.layer_begin, local.layer_end,
+                                         /*allocate_target_feat=*/false)) {
+            std::fprintf(stderr, "[target-split] mixed local load/cache gpu=%d: %s\n",
+                         local.gpu, dflash27b_last_error());
+            return false;
+        }
+    }
+
+    std::vector<int> remote_gpus;
+    std::vector<int> remote_layer_begins;
+    std::vector<int> remote_layer_ends;
+    for (size_t i = remote_begin; i < cfg_.device.layer_split_gpus.size(); ++i) {
+        remote_gpus.push_back(cfg_.device.layer_split_gpus[i]);
+        remote_layer_begins.push_back(ranges[i].begin);
+        remote_layer_ends.push_back(ranges[i].end);
+    }
+    if (!remote_target_shard_.start(
+            cfg_.remote_target_shard.ipc_bin, cfg_.target_path, remote_gpus,
+            remote_layer_begins, remote_layer_ends, cfg_.device.max_ctx,
+            cfg_.max_verify_tokens, cfg_.kq_stride_pad, cfg_.fa_window,
+            shards_.front().weights.n_embd, shards_.front().weights.n_vocab,
+            std::max(1, cfg_.device.max_ctx),
+            cfg_.remote_target_shard.work_dir,
+            cfg_.run_dflash)) {
+        std::fprintf(stderr,
+            "[target-split] remote target shard start failed layers=[%d,%d)\n",
+            remote_layer_begins.front(), remote_layer_ends.back());
+        return false;
+    }
+
+    if (cfg_.draft_path && cfg_.run_dflash && !load_draft()) {
+        return false;
+    }
+
+    for (const auto & local : shards_) {
+        std::fprintf(stderr, "[target-split] local %s:%d layers=[%d,%d)\n",
+                     placement_backend_name(local.placement_backend),
+                     local.gpu, local.layer_begin, local.layer_end);
+    }
+    for (size_t i = 0; i < remote_gpus.size(); ++i) {
+        std::fprintf(stderr, "[target-split] remote %s:%d layers=[%d,%d)\n",
+                     placement_backend_name(remote_backend),
+                     remote_gpus[i], remote_layer_begins[i], remote_layer_ends[i]);
+    }
+
+    prefix_snapshots_.resize(PREFIX_SLOTS);
+    for (auto & slot : prefix_snapshots_) {
+        slot.resize(shards_.size());
+    }
+    snapshot_backends_.assign(shards_.size(), nullptr);
+    for (size_t i = 0; i < shards_.size(); ++i) {
+        snapshot_backends_[i] = create_snapshot_backend(shards_[i].backend);
+        if (!snapshot_backends_[i]) {
+            std::fprintf(stderr,
+                "[target-split] mixed snapshot backend init failed gpu=%d\n",
+                shards_[i].gpu);
+            return false;
+        }
+    }
+    snapshot_prefill_logits_.resize(PREFIX_SLOTS);
+    draft_feature_snapshots_.resize(PREFIX_SLOTS);
     return true;
 }
 
@@ -147,6 +289,11 @@ void Qwen35LayerSplitAdapter::begin_request(const GenerateRequest & req) {
 
 void Qwen35LayerSplitAdapter::reset_request_state() {
     for (auto & shard : shards_) reset_target_cache(shard.cache);
+    if (use_mixed_target_split() &&
+        !remote_target_shard_.reset_request_state()) {
+        std::fprintf(stderr,
+            "[target-split] remote shard reset_request_state failed\n");
+    }
     prefill_last_logits_.clear();
 }
 
@@ -166,6 +313,16 @@ bool Qwen35LayerSplitAdapter::prefill(const std::vector<int32_t> & prompt,
     int ubatch = prompt.size() > 2048 ? 384 : 16;
     if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
         ubatch = std::max(1, std::atoi(s));
+    }
+    if (use_mixed_target_split()) {
+        return run_qwen35_mixed_layer_split_forward(
+            shards_, remote_target_shard_, shards_.front().weights,
+            prompt, base_pos, ubatch, last_tok,
+            cfg_.kq_stride_pad, /*fa_window=*/0,
+            /*argmax_out=*/nullptr,
+            &prefill_last_logits_,
+            (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
+            remote_draft_.active() ? &remote_draft_ : nullptr);
     }
     return run_qwen35_layer_split_forward(
         shards_, shards_.front().weights, prompt, base_pos, ubatch, last_tok,
@@ -197,6 +354,10 @@ bool Qwen35LayerSplitAdapter::snapshot_save(int slot) {
             return false;
         }
     }
+    if (use_mixed_target_split() && !remote_target_shard_.snapshot_save(slot)) {
+        snapshot_free(slot);
+        return false;
+    }
     if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
     snapshot_prefill_logits_[(size_t)slot] = prefill_last_logits_;
     if (!snapshot_draft_features(slot)) {
@@ -213,6 +374,9 @@ void Qwen35LayerSplitAdapter::snapshot_free(int slot) {
     }
     if (snapshot_prefill_logits_.size() == (size_t)PREFIX_SLOTS) {
         snapshot_prefill_logits_[(size_t)slot].clear();
+    }
+    if (use_mixed_target_split()) {
+        remote_target_shard_.snapshot_free(slot);
     }
     free_draft_feature_snapshot(slot);
 }
@@ -251,6 +415,10 @@ bool Qwen35LayerSplitAdapter::snapshot_restore(int slot) {
             !restore_target_cache(snaps[i], shards_[i].cache)) {
             return false;
         }
+    }
+    if (use_mixed_target_split() &&
+        !remote_target_shard_.snapshot_restore(slot)) {
+        return false;
     }
     if (snapshot_prefill_logits_.size() != (size_t)PREFIX_SLOTS) return false;
     prefill_last_logits_ = snapshot_prefill_logits_[(size_t)slot];
@@ -358,6 +526,16 @@ bool Qwen35LayerSplitAdapter::decode_ar(
         sampler_rng_,
         [&](const std::vector<int32_t> & one, int pos, int & next_tok,
             std::vector<float> * logits_out) {
+            if (use_mixed_target_split()) {
+                return run_qwen35_mixed_layer_split_forward(
+                    shards_, remote_target_shard_, shards_.front().weights,
+                    one, pos, 1, next_tok,
+                    cfg_.kq_stride_pad, cfg_.fa_window,
+                    /*argmax_out=*/nullptr,
+                    logits_out,
+                    (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
+                    remote_draft_.active() ? &remote_draft_ : nullptr);
+            }
             return run_qwen35_layer_split_forward(
                 shards_, shards_.front().weights, one, pos, 1, next_tok,
                 cfg_.kq_stride_pad, cfg_.fa_window,
@@ -375,20 +553,26 @@ bool Qwen35LayerSplitAdapter::can_dflash_decode() const {
 
 bool Qwen35LayerSplitAdapter::decode_dflash(
         const std::vector<int32_t> & prompt, int base_pos, int last_tok, int n_gen,
-        std::vector<int32_t> & out_tokens, const DaemonIO & io) {
+        std::vector<int32_t> & out_tokens, const DaemonIO & io,
+        float & accept_rate_out) {
+    accept_rate_out = 0.0f;
     const bool use_remote_draft = remote_draft_.active();
     Qwen35LayerSplitDFlashTarget target(
         shards_, use_remote_draft ? nullptr : &feature_ring_,
         cfg_.kq_stride_pad, cfg_.fa_window,
-        use_remote_draft ? &remote_draft_ : nullptr);
+        use_remote_draft ? &remote_draft_ : nullptr,
+        use_mixed_target_split() ? &remote_target_shard_ : nullptr);
     DaemonIO collect_io = io.with_token_callback([&](int32_t tok) -> bool {
         out_tokens.push_back(tok);
         return true;
     });
+    double accept_rate = 0.0;
     const bool ok = run_dflash_spec_decode(
         target, draft_weights_, draft_backend_, feature_ring_, prompt, n_gen,
         last_tok, /*out_path=*/nullptr, cfg_.draft_ctx_max, collect_io,
-        use_remote_draft ? &remote_draft_ : nullptr, /*hint_tokens=*/nullptr, base_pos);
+        use_remote_draft ? &remote_draft_ : nullptr, /*hint_tokens=*/nullptr, base_pos,
+        &accept_rate);
+    accept_rate_out = (float)accept_rate;
     return ok;
 }
 
@@ -444,7 +628,8 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
             shards_,
             (cfg_.run_dflash && !remote_draft_.active()) ? &feature_ring_ : nullptr,
             cfg_.kq_stride_pad, cfg_.fa_window,
-            remote_draft_.active() ? &remote_draft_ : nullptr);
+            remote_draft_.active() ? &remote_draft_ : nullptr,
+            use_mixed_target_split() ? &remote_target_shard_ : nullptr);
     }
     return dflash_target_.get();
 }
@@ -452,6 +637,7 @@ DFlashTarget * Qwen35LayerSplitAdapter::dflash_target() {
 void Qwen35LayerSplitAdapter::shutdown() {
     dflash_target_.reset();
     free_drafter();
+    remote_target_shard_.close();
     draft_feature_mirror_free(feature_ring_);
     free_draft_weights(draft_weights_);
     for (auto & slot : prefix_snapshots_) {
