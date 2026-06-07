@@ -7,10 +7,14 @@
 #include "sse_emitter.h"
 #include "tool_hint.h"
 
+#include <curl/curl.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -26,6 +30,218 @@
 #include <unistd.h>
 
 namespace dflash::common {
+
+// ─── piecewise keep-ratio curve ─────────────────────────────────────────
+
+static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
+    if (cfg.pflash_curve.empty()) return cfg.pflash_keep_ratio;
+    const auto & curve = cfg.pflash_curve;
+    if (n_tokens <= curve.front().first) return curve.front().second;
+    if (n_tokens >= curve.back().first)  return curve.back().second;
+    for (size_t i = 0; i + 1 < curve.size(); ++i) {
+        if (n_tokens <= curve[i + 1].first) {
+            float t = (float)(n_tokens - curve[i].first) /
+                      (float)(curve[i + 1].first - curve[i].first);
+            return curve[i].second + t * (curve[i + 1].second - curve[i].second);
+        }
+    }
+    return curve.back().second;
+}
+
+// ─── curl helpers for upstream proxy ─────────────────────────────────────
+
+struct CurlWriteCtx {
+    int client_fd;
+    bool streaming;
+    bool first_chunk;
+    bool chat_rewrite;   // rewrite completions → chat format
+    std::string buffer;  // accumulates non-streaming response
+    std::string response_id;
+    std::string model;
+};
+
+static size_t curl_write_passthrough(char * ptr, size_t size, size_t nmemb, void * userdata) {
+    size_t total = size * nmemb;
+    auto * ctx = static_cast<CurlWriteCtx *>(userdata);
+    if (ctx->streaming) {
+        ::send(ctx->client_fd, ptr, total, MSG_NOSIGNAL);
+    } else {
+        ctx->buffer.append(ptr, total);
+    }
+    return total;
+}
+
+static size_t curl_write_rewrite(char * ptr, size_t size, size_t nmemb, void * userdata) {
+    size_t total = size * nmemb;
+    auto * ctx = static_cast<CurlWriteCtx *>(userdata);
+
+    if (!ctx->streaming) {
+        ctx->buffer.append(ptr, total);
+        return total;
+    }
+
+    // Streaming: rewrite completions SSE chunks → chat completions format.
+    ctx->buffer.append(ptr, total);
+    std::string & buf = ctx->buffer;
+    size_t pos = 0;
+    while (true) {
+        size_t nl = buf.find('\n', pos);
+        if (nl == std::string::npos) break;
+        std::string line = buf.substr(pos, nl - pos);
+        pos = nl + 1;
+        if (line.empty() || line == "\r") {
+            std::string out = "\n";
+            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            continue;
+        }
+        if (line.size() > 0 && line.back() == '\r') line.pop_back();
+        if (line.rfind("data: ", 0) != 0) {
+            line += "\n";
+            ::send(ctx->client_fd, line.data(), line.size(), MSG_NOSIGNAL);
+            continue;
+        }
+        std::string payload = line.substr(6);
+        if (payload == "[DONE]") {
+            std::string out = "data: [DONE]\n\n";
+            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+            continue;
+        }
+        try {
+            auto j = json::parse(payload);
+            j["object"] = "chat.completion.chunk";
+            if (j.contains("choices") && j["choices"].is_array()) {
+                for (auto & c : j["choices"]) {
+                    json delta;
+                    if (ctx->first_chunk) {
+                        delta["role"] = "assistant";
+                        ctx->first_chunk = false;
+                    }
+                    if (c.contains("text")) {
+                        delta["content"] = c["text"];
+                        c.erase("text");
+                    }
+                    c["delta"] = delta;
+                    c.erase("index"); // re-add below
+                    if (!c.contains("index")) c["index"] = 0;
+                }
+            }
+            std::string out = "data: " + j.dump() + "\n\n";
+            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+        } catch (...) {
+            std::string out = line + "\n";
+            ::send(ctx->client_fd, out.data(), out.size(), MSG_NOSIGNAL);
+        }
+    }
+    buf.erase(0, pos);
+    return total;
+}
+
+static json rewrite_completions_to_chat(const json & comp_resp) {
+    json chat_resp;
+    chat_resp["id"] = comp_resp.value("id", "");
+    chat_resp["object"] = "chat.completion";
+    chat_resp["created"] = comp_resp.value("created", 0);
+    chat_resp["model"] = comp_resp.value("model", "");
+    if (comp_resp.contains("usage")) chat_resp["usage"] = comp_resp["usage"];
+    json choices = json::array();
+    if (comp_resp.contains("choices") && comp_resp["choices"].is_array()) {
+        for (const auto & c : comp_resp["choices"]) {
+            json choice;
+            choice["index"] = c.value("index", 0);
+            choice["finish_reason"] = c.value("finish_reason", "stop");
+            json msg = {{"role", "assistant"}, {"content", c.value("text", "")}};
+            choice["message"] = msg;
+            choices.push_back(choice);
+        }
+    }
+    chat_resp["choices"] = choices;
+    return chat_resp;
+}
+
+static bool curl_forward(int client_fd, const std::string & url,
+                         const std::string & api_key, const json & body,
+                         bool streaming, bool rewrite_to_chat,
+                         const std::string & response_id,
+                         const std::string & model) {
+    CURL * curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::string body_str = body.dump();
+
+    struct curl_slist * headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (!api_key.empty()) {
+        std::string auth = "Authorization: Bearer " + api_key;
+        headers = curl_slist_append(headers, auth.c_str());
+    }
+
+    CurlWriteCtx ctx;
+    ctx.client_fd = client_fd;
+    ctx.streaming = streaming;
+    ctx.first_chunk = true;
+    ctx.chat_rewrite = rewrite_to_chat;
+    ctx.response_id = response_id;
+    ctx.model = model;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_str.size());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 600L);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+
+    if (rewrite_to_chat) {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_rewrite);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_passthrough);
+    }
+
+    if (streaming) {
+        std::string sse_header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n";
+        ::send(client_fd, sse_header.data(), sse_header.size(), MSG_NOSIGNAL);
+    }
+
+    CURLcode res = curl_easy_perform(curl);
+
+    if (!streaming && res == CURLE_OK) {
+        // Non-streaming: send accumulated response.
+        if (rewrite_to_chat) {
+            try {
+                json resp = json::parse(ctx.buffer);
+                json chat_resp = rewrite_completions_to_chat(resp);
+                std::string out = chat_resp.dump();
+                std::string http =
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: " + std::to_string(out.size()) + "\r\n"
+                    "\r\n" + out;
+                ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+            } catch (...) {
+                std::string http =
+                    "HTTP/1.1 502 Bad Gateway\r\n"
+                    "Content-Type: application/json\r\n"
+                    "\r\n{\"error\":\"upstream response parse failed\"}";
+                ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+            }
+        } else {
+            std::string http =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: " + std::to_string(ctx.buffer.size()) + "\r\n"
+                "\r\n" + ctx.buffer;
+            ::send(client_fd, http.data(), http.size(), MSG_NOSIGNAL);
+        }
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return res == CURLE_OK;
+}
 
 // ─── /props constants ───────────────────────────────────────────────────
 //
@@ -81,6 +297,90 @@ static const char * api_format_name(ApiFormat format) {
 
 static size_t json_array_size(const json & value) {
     return value.is_array() ? value.size() : 0;
+}
+
+static bool env_flag_enabled(const char * name) {
+    const char * raw = std::getenv(name);
+    if (!raw || !*raw) return false;
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return value != "0" && value != "false" && value != "no" &&
+           value != "off";
+}
+
+static const json * find_tool_function(const json & tools,
+                                       const std::string & name) {
+    if (!tools.is_array() || name.empty()) return nullptr;
+    for (const auto & tool : tools) {
+        if (!tool.contains("function") || !tool["function"].is_object()) {
+            continue;
+        }
+        const json & fn = tool["function"];
+        if (fn.value("name", "") == name) return &fn;
+    }
+    return nullptr;
+}
+
+static std::string first_tool_parameter_name(const json & function_def) {
+    const auto & params = function_def.value("parameters", json::object());
+    if (params.contains("required") && params["required"].is_array()) {
+        for (const auto & name : params["required"]) {
+            if (name.is_string()) return name.get<std::string>();
+        }
+    }
+    if (params.contains("properties") && params["properties"].is_object()) {
+        for (const auto & item : params["properties"].items()) {
+            return item.key();
+        }
+    }
+    return "";
+}
+
+static const json * select_stall_recovery_function(const json & tools,
+                                                   const json & tool_choice) {
+    if (!tools.is_array() || tools.empty()) return nullptr;
+
+    if (tool_choice.is_object() && tool_choice.contains("function") &&
+        tool_choice["function"].is_object()) {
+        const std::string forced_name =
+            tool_choice["function"].value("name", "");
+        // If the request forced a concrete function, recovery must honor it;
+        // falling back to terminal here would synthesize invalid tool XML.
+        return find_tool_function(tools, forced_name);
+    }
+
+    if (tool_choice.is_string() && tool_choice.get<std::string>() == "required" &&
+        tools.size() == 1 && tools[0].contains("function") &&
+        tools[0]["function"].is_object()) {
+        return &tools[0]["function"];
+    }
+
+    if (const json * terminal = find_tool_function(tools, "terminal")) {
+        return terminal;
+    }
+    if (tools.size() == 1 && tools[0].contains("function") &&
+        tools[0]["function"].is_object()) {
+        return &tools[0]["function"];
+    }
+    return nullptr;
+}
+
+static std::string build_stall_tool_prefix(const json & tools,
+                                           const json & tool_choice) {
+    const json * function_def =
+        select_stall_recovery_function(tools, tool_choice);
+    if (!function_def) return "\n<function=";
+
+    const std::string name = function_def->value("name", "");
+    if (name.empty()) return "\n<function=";
+
+    std::string prefix = "\n<function=" + name + ">\n";
+    std::string param = first_tool_parameter_name(*function_def);
+    if (!param.empty()) {
+        prefix += "<parameter=" + param + ">\n";
+    }
+    return prefix;
 }
 
 // Build the /props response body.
@@ -470,6 +770,7 @@ HttpServer::HttpServer(ModelBackend & backend,
                    config.disk_cache_continued_interval,
                    config.disk_cache_cold_max_tokens}, backend)
 {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
     disk_cache_.init();
     status_html_path_ = resolve_status_html();
 }
@@ -605,6 +906,7 @@ void HttpServer::sse_heartbeat() {
 
 HttpServer::~HttpServer() {
     shutdown();
+    curl_global_cleanup();
 }
 
 void HttpServer::shutdown() {
@@ -960,6 +1262,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
 
     try {
         json body = json::parse(hr.body);
+        req.raw_body = body;
 
         // Common fields.
         req.stream = body.value("stream", false);
@@ -1372,10 +1675,9 @@ void HttpServer::worker_loop() {
             req.max_output,
             json_array_size(req.tools));
 
-        // Send SSE headers.
-        if (req.stream) {
+        // Send SSE headers (skip when proxying — curl_forward handles its own headers).
+        if (req.stream && config_.pflash_upstream_base.empty()) {
             if (!send_sse_headers(fd)) {
-                // Client already disconnected before we started.
                 finish_job();
                 continue;
             }
@@ -1387,8 +1689,8 @@ void HttpServer::worker_loop() {
                            &tool_memory_,
                            req.stop_sequences);
 
-        // Emit initial SSE events.
-        if (req.stream) {
+        // Emit initial SSE events (skip when proxying).
+        if (req.stream && config_.pflash_upstream_base.empty()) {
             bool start_ok = true;
             for (const auto & chunk : emitter.emit_start()) {
                 if (!send_all(fd, chunk.data(), chunk.size())) {
@@ -1441,9 +1743,9 @@ void HttpServer::worker_loop() {
                         // 3. Compress via typed API
                         ModelBackend::CompressRequest creq;
                         creq.input_ids = std::move(drafter_ids);
-                        // Bandit: use per-session keep_ratio if session_id provided.
+                        // Bandit overrides curve when session_id is present.
                         creq.keep_ratio = req.session_id.empty()
-                            ? config_.pflash_keep_ratio
+                            ? pflash_keep_ratio(config_, n_prompt)
                             : sessions_.get_keep_ratio(req.session_id);
                         creq.drafter_path = config_.pflash_drafter_path;
                         creq.drafter_gpu = config_.pflash_drafter_gpu;
@@ -1483,7 +1785,55 @@ void HttpServer::worker_loop() {
                             std::string compressed_text =
                                 drafter_tokenizer_->decode(cresult.compressed_ids);
 
-                            // 5. Re-tokenize with target tokenizer
+                            // 5. Query survival check: verify the last user
+                            //    message survived compression. If < 80% of its
+                            //    tokens are present, re-append the full query.
+                            std::string last_user_text;
+                            if (req.messages.is_array()) {
+                                for (int mi = (int)req.messages.size() - 1; mi >= 0; --mi) {
+                                    if (req.messages[mi].value("role", "") == "user") {
+                                        auto & c = req.messages[mi]["content"];
+                                        if (c.is_string()) {
+                                            last_user_text = c.get<std::string>();
+                                        } else if (c.is_array()) {
+                                            for (const auto & part : c) {
+                                                std::string ptype = part.value("type", "");
+                                                if (ptype == "text" || ptype == "input_text" ||
+                                                    ptype == "output_text") {
+                                                    last_user_text += part.value("text", "");
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!last_user_text.empty() && drafter_tokenizer_) {
+                                auto query_ids = drafter_tokenizer_->encode(last_user_text);
+                                int query_kept = 0;
+                                if (!query_ids.empty()) {
+                                    int qi = (int)query_ids.size() - 1;
+                                    for (int ki = (int)cresult.compressed_ids.size() - 1; ki >= 0 && qi >= 0; --ki) {
+                                        if (cresult.compressed_ids[ki] == query_ids[qi]) {
+                                            ++query_kept;
+                                            --qi;
+                                        }
+                                    }
+                                }
+                                float survival = (float)query_kept / std::max(1, (int)query_ids.size());
+                                std::fprintf(stderr, "[pflash] query survival: %d/%d (%.0f%%)\n",
+                                             query_kept, (int)query_ids.size(), survival * 100.0f);
+                                if (survival < 0.80f && (int)query_ids.size() < 1000) {
+                                    compressed_text += "\n" + last_user_text;
+                                    std::fprintf(stderr, "[pflash] query below 80%% — re-appended full query (%d tokens)\n",
+                                                 (int)query_ids.size());
+                                } else if (survival < 0.80f) {
+                                    std::fprintf(stderr, "[pflash] query below 80%% but too large to re-append (%d tokens)\n",
+                                                 (int)query_ids.size());
+                                }
+                            }
+
+                            // 6. Re-tokenize with target tokenizer
                             effective_prompt = tokenizer_.encode(compressed_text);
                             pflash_compressed = true;
 
@@ -1504,6 +1854,56 @@ void HttpServer::worker_loop() {
                     }
                 }
             }
+        }
+
+        // ── Upstream proxy: forward to remote server if configured ────
+        if (!config_.pflash_upstream_base.empty()) {
+            const std::string & upstream = config_.pflash_upstream_base;
+            const std::string & upstream_key = config_.pflash_upstream_key;
+            const std::string & upstream_model = config_.pflash_upstream_model.empty()
+                ? req.model : config_.pflash_upstream_model;
+
+            if (pflash_compressed) {
+                std::string compressed_text = tokenizer_.decode(effective_prompt);
+                compressed_text += "\n<|im_start|>assistant\n";
+
+                json comp_body;
+                comp_body["model"] = upstream_model;
+                comp_body["prompt"] = compressed_text;
+                comp_body["stream"] = req.stream;
+                if (req.raw_body.contains("max_tokens"))
+                    comp_body["max_tokens"] = req.raw_body["max_tokens"];
+                else
+                    comp_body["max_tokens"] = req.max_output;
+                for (const char * key : {"temperature", "top_p", "top_k", "min_p",
+                                         "frequency_penalty", "presence_penalty",
+                                         "stop", "seed"}) {
+                    if (req.raw_body.contains(key)) comp_body[key] = req.raw_body[key];
+                }
+
+                std::fprintf(stderr,
+                    "[pflash-proxy] compressed forward → %s/completions  prompt=%zu tokens  model=%s\n",
+                    upstream.c_str(), effective_prompt.size(), upstream_model.c_str());
+
+                curl_forward(fd, upstream + "/completions",
+                             upstream_key, comp_body,
+                             req.stream, /*rewrite_to_chat=*/true,
+                             req.response_id, upstream_model);
+            } else {
+                json fwd_body = req.raw_body;
+                fwd_body["model"] = upstream_model;
+
+                std::fprintf(stderr,
+                    "[pflash-proxy] passthrough → %s/chat/completions  model=%s\n",
+                    upstream.c_str(), upstream_model.c_str());
+
+                curl_forward(fd, upstream + "/chat/completions",
+                             upstream_key, fwd_body,
+                             req.stream, /*rewrite_to_chat=*/false,
+                             req.response_id, upstream_model);
+            }
+            finish_job();
+            continue;
         }
 
         // Build generate request.
@@ -1576,6 +1976,38 @@ void HttpServer::worker_loop() {
                 gen_req.hint_tokens = &hint_tokens_storage;
             }
         }
+        std::vector<int32_t> stall_tool_prefix_tokens_storage;
+        std::vector<int32_t> stall_action_suffix_tokens_storage;
+        std::vector<int32_t> stall_skip_tokens_storage;
+        if (!req.tools.empty() && env_flag_enabled("DFLASH_STALL_TOOL_PREFIX")) {
+            stall_tool_prefix_tokens_storage =
+                tokenizer_.encode(build_stall_tool_prefix(req.tools,
+                                                          req.tool_choice));
+            stall_action_suffix_tokens_storage = tokenizer_.encode(":");
+            // The stall detector only asks "did the model just end on an action
+            // suffix?" by matching individual recent tokens (tokens_have_recent_any),
+            // so we collect the trailing token of each colon variant rather than the
+            // full encoded sequence. The final ":" piece is what actually precedes the
+            // premature EOS regardless of how the preamble before it tokenizes, so a
+            // flat set of these terminal tokens is the right granularity here.
+            auto add_suffix_terminal = [&](const std::string & text) {
+                auto ids = tokenizer_.encode(text);
+                if (ids.empty()) return;
+                int32_t tok = ids.back();
+                if (std::find(stall_action_suffix_tokens_storage.begin(),
+                              stall_action_suffix_tokens_storage.end(), tok) ==
+                    stall_action_suffix_tokens_storage.end()) {
+                    stall_action_suffix_tokens_storage.push_back(tok);
+                }
+            };
+            add_suffix_terminal("`:");
+            add_suffix_terminal("):");
+            add_suffix_terminal("\":");
+            stall_skip_tokens_storage = tokenizer_.encode(" done");
+            gen_req.stall_tool_prefix_tokens = &stall_tool_prefix_tokens_storage;
+            gen_req.stall_action_suffix_tokens = &stall_action_suffix_tokens_storage;
+            gen_req.stall_skip_tokens = &stall_skip_tokens_storage;
+        }
 
         // Prefix cache: check for cached KV state.
         auto [cache_slot, prefix_len] = prefix_cache_.lookup(effective_prompt);
@@ -1629,7 +2061,7 @@ void HttpServer::worker_loop() {
                 cold_req.snap_pos = cold_boundary;  // save at end of prefix
                 DaemonIO cold_io;
                 cold_io.stream_fd = -1;
-                auto cold_result = backend_.generate_with_empty_spec_fallback(cold_req, cold_io);
+                auto cold_result = backend_.generate(cold_req, cold_io);
                 if (cold_result.ok && backend_.snapshot_used(DISK_STAGING_SLOT)) {
                     disk_cache_.learn_layout(DISK_STAGING_SLOT);
                     std::vector<int32_t> prefix_tokens(effective_prompt.begin(),
@@ -1689,6 +2121,7 @@ void HttpServer::worker_loop() {
         };
 
         int completion_tokens = 0;
+        bool visible_output_seen = false;
         bool client_disconnected = false;
 
         io.on_token = [&](int32_t token) -> bool {
@@ -1710,6 +2143,7 @@ void HttpServer::worker_loop() {
 
             // Gemma4 thinking channel: map <|channel> → <think>, <channel|> → </think>\n
             if (raw == "<|channel>") {
+                visible_output_seen = true;
                 broadcast_token("<think>");
                 if (req.stream) {
                     auto chunks = emitter.emit_token("<think>");
@@ -1719,6 +2153,7 @@ void HttpServer::worker_loop() {
                 return true;
             }
             if (raw == "<channel|>") {
+                visible_output_seen = true;
                 broadcast_token("</think>\n");
                 if (req.stream) {
                     auto chunks = emitter.emit_token("</think>\n");
@@ -1736,6 +2171,7 @@ void HttpServer::worker_loop() {
             // reasoning_content with empty visible content. Forward the text
             // form into the emitter so parse_reasoning() can split correctly.
             if (raw == "<think>" || raw == "</think>") {
+                visible_output_seen = true;
                 broadcast_token(raw == "</think>" ? "</think>\n" : "<think>");
                 if (req.stream) {
                     auto chunks = emitter.emit_token(
@@ -1757,6 +2193,7 @@ void HttpServer::worker_loop() {
 
             // Send token text to status page clients (browser accumulates).
             if (!text.empty()) {
+                visible_output_seen = true;
                 broadcast_token(text);
             }
 
@@ -1798,9 +2235,9 @@ void HttpServer::worker_loop() {
 
         GenerateResult result;
         if (using_restore) {
-            result = backend_.restore_and_generate_with_empty_spec_fallback(cache_slot, gen_req, io);
+            result = backend_.restore_and_generate(cache_slot, gen_req, io);
         } else {
-            result = backend_.generate_with_empty_spec_fallback(gen_req, io);
+            result = backend_.generate(gen_req, io);
         }
 
         if (dflash_residency == DraftResidencyAction::ReleaseAfterUse &&
@@ -1829,7 +2266,7 @@ void HttpServer::worker_loop() {
 
         // Confirm or abort the inline snapshot.
         if (snap_prepared) {
-            if (completion_tokens > 0 && !client_disconnected &&
+            if (completion_tokens > 0 && visible_output_seen && !client_disconnected &&
                 backend_.snapshot_used(snap_slot)) {
                 prefix_cache_.confirm_inline_snap(snap_slot, snap_cut, effective_prompt);
                 // Track for shutdown save.
@@ -1852,7 +2289,8 @@ void HttpServer::worker_loop() {
 
         // Continued checkpoint: save if total tokens crossed an interval boundary.
         // This captures prompt + all generated tokens for long conversation reuse.
-        if (!disk_cache_.disabled() && result.ok && completion_tokens > 0 && !client_disconnected) {
+        if (!disk_cache_.disabled() && result.ok && completion_tokens > 0 &&
+            visible_output_seen && !client_disconnected) {
             int final_pos = (int)effective_prompt.size() + (int)result.tokens.size();
             if (final_pos >= disk_cache_.continued_interval()) {
                 // Build all_tokens = effective_prompt + result.tokens
@@ -1868,7 +2306,8 @@ void HttpServer::worker_loop() {
         }
 
         // Full-compress cache: reserve + confirm after successful generation.
-        if (pflash_compressed && completion_tokens > 0 && !client_disconnected) {
+        if (pflash_compressed && completion_tokens > 0 &&
+            visible_output_seen && !client_disconnected) {
             int full_slot = prefix_cache_.prepare_full_snap(req.prompt_tokens);
             if (full_slot >= 0) {
                 prefix_cache_.confirm_full_snap(full_slot, req.prompt_tokens,
@@ -2017,6 +2456,9 @@ void HttpServer::worker_loop() {
                     if (at_cap) {
                         effective_finish_reason = "length";
                     }
+                }
+                if (result.degenerate_decode_close) {
+                    effective_finish_reason = "length";
                 }
                 json choice = {
                     {"index", 0}, {"message", msg},

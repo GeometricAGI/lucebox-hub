@@ -10,13 +10,15 @@
 #pragma once
 
 #include "internal.h"
-#include "qwen35moe_hybrid_ffn_eval.h"
-#include "qwen35moe_hybrid_storage.h"
+#include "../common/moe_hybrid_ffn_eval.h"
+#include "../common/moe_hybrid_storage.h"
+#include "../common/cold_ffn_compute.h"
 #include "graph_builders.h"
 
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace dflash::common {
@@ -65,9 +67,30 @@ struct PipelinedDecodeTelemetry {
     uint64_t ffn_us = 0;
     uint64_t ffn_allhot_us = 0;
     uint64_t ffn_mixed_us = 0;
+    // GPU utilization diagnosis: time the GPU is idle waiting for CPU
+    uint64_t gpu_idle_us = 0;       // total GPU idle (tensor_io + combine_overhead + sync_wait)
+    uint64_t tensor_io_us = 0;      // hot path setup: D2H readback + GPU copies + kernel launch
+    uint64_t combine_overhead_us = 0; // combine graph dispatch + copy
+    uint64_t cold_cpu_us = 0;       // cold path total (graph build + ggml CPU compute)
+    uint64_t cold_compute_us = 0;   // just ggml_backend_graph_compute(cpu_be) time
+    uint64_t hot_graph_build_us = 0; // hot graph rebuild (only when n_hot changes)
+    uint64_t ffn_post_get_us = 0;   // D2H readback of ffn_post for cold path
+    uint64_t sync_wait_us = 0;      // time in ggml_backend_synchronize (waiting for GPU)
     int allhot_layers = 0;
     int mixed_layers = 0;
     int total_layers = 0;
+    int hot_graph_rebuilds = 0;     // count of hot graph rebuilds
+    int routed_ffn_layers = 0;      // layers handled by routed FFN (async pipeline)
+
+    // ── Routed path breakdown (StreamMoE fast path) ──
+    uint64_t routed_prefn_us = 0;       // prefn graph compute (async dispatch + sync)
+    uint64_t routed_sync_us = 0;        // GPU sync stall waiting for prefn
+    uint64_t routed_readback_us = 0;    // D2H readback of routing IDs + weights
+    uint64_t routed_cpu_remap_us = 0;   // CPU-side local ID mapping + cold masking
+    uint64_t routed_ffn_dispatch_us = 0;// FFN graph dispatch + combine (async)
+    uint64_t routed_final_sync_us = 0;  // final sync at end of token (if measured)
+    int routed_cold_expert_hits = 0;    // experts masked (weight=0) in routed path
+    int routed_total_expert_slots = 0;  // total expert slots processed
 };
 
 // State for pipelined decode: holds cached DeltaNet pre-FFN graphs +
@@ -79,6 +102,10 @@ struct PipelinedDecodeState {
     // Attention layers (every full_attention_interval-th) are nullptr (rebuilt each token)
     std::vector<CachedPrefnGraph> cached_prefn;
 
+    // Cached routed FFN graphs for DeltaNet layers (layer index → graph)
+    // StreamMoE-inspired: reads routing from GPU, eliminates CPU sync.
+    std::vector<CachedFfnGraph> cached_routed_ffn;
+
     // Persistent host buffers (avoid per-layer allocation)
     std::vector<int32_t> routing_ids_buf;
     std::vector<float> routing_weights_buf;
@@ -86,6 +113,16 @@ struct PipelinedDecodeState {
 
     // Persistent zero buffer for cold_in (set once at init)
     bool cold_in_zeroed = false;
+
+    // When true (default), cold experts are computed on the cold backend
+    // (CPU/Halo) instead of being dropped via cold-masking. Exact but slower.
+    // Set DFLASH_DROP_COLD=1 to disable (fast but lossy).
+    bool cold_compute = true;
+
+    // Fused cold FFN compute (bypasses ggml graph dispatch overhead)
+    std::unique_ptr<ColdFfnCompute> cold_ffn_compute;
+    std::vector<ColdFfnLayer> cold_ffn_layers;   // per-layer cold weight metadata
+    std::vector<float> cold_output_buf;           // [n_embd] scratch for cold FFN output
 
     // Tracking
     int n_layer = 0;
@@ -100,10 +137,15 @@ struct PipelinedDecodeState {
     PipelinedDecodeState(PipelinedDecodeState && o) noexcept
         : gpu_state(std::move(o.gpu_state)),
           cached_prefn(std::move(o.cached_prefn)),
+          cached_routed_ffn(std::move(o.cached_routed_ffn)),
           routing_ids_buf(std::move(o.routing_ids_buf)),
           routing_weights_buf(std::move(o.routing_weights_buf)),
           ffn_post_host_buf(std::move(o.ffn_post_host_buf)),
           cold_in_zeroed(o.cold_in_zeroed),
+          cold_compute(o.cold_compute),
+          cold_ffn_compute(std::move(o.cold_ffn_compute)),
+          cold_ffn_layers(std::move(o.cold_ffn_layers)),
+          cold_output_buf(std::move(o.cold_output_buf)),
           n_layer(o.n_layer), n_embd(o.n_embd),
           n_expert_used(o.n_expert_used),
           full_attention_interval(o.full_attention_interval) {
@@ -114,10 +156,15 @@ struct PipelinedDecodeState {
             destroy();
             gpu_state = std::move(o.gpu_state);
             cached_prefn = std::move(o.cached_prefn);
+            cached_routed_ffn = std::move(o.cached_routed_ffn);
             routing_ids_buf = std::move(o.routing_ids_buf);
             routing_weights_buf = std::move(o.routing_weights_buf);
             ffn_post_host_buf = std::move(o.ffn_post_host_buf);
             cold_in_zeroed = o.cold_in_zeroed;
+            cold_compute = o.cold_compute;
+            cold_ffn_compute = std::move(o.cold_ffn_compute);
+            cold_ffn_layers = std::move(o.cold_ffn_layers);
+            cold_output_buf = std::move(o.cold_output_buf);
             n_layer = o.n_layer; n_embd = o.n_embd;
             n_expert_used = o.n_expert_used;
             full_attention_interval = o.full_attention_interval;
@@ -136,6 +183,7 @@ bool init_pipelined_decode_state(
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
+    MoeHybridStorage & hybrid,
     int kv_start,           // initial KV position for graph caching
     int kq_stride_pad);
 
@@ -147,7 +195,7 @@ bool pipelined_decode_one_token(
     ggml_backend_t backend,
     const TargetWeights & w,
     TargetCache & cache,
-    Qwen35MoeHybridStorage & hybrid,
+    MoeHybridStorage & hybrid,
     int kv_pos,              // current KV position
     int kq_stride_pad,
     PipelinedDecodeTelemetry * telemetry = nullptr);

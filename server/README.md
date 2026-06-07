@@ -170,6 +170,37 @@ Run it directly:
   --model-name luce-dflash
 ```
 
+### Compression proxy mode
+
+`dflash_server` can run as a **PFlash compression proxy** in front of any
+OpenAI-compatible backend instead of doing local inference. When
+`--prefill-upstream-base` is set, each request is compressed (PFlash) and
+forwarded upstream: compressed requests are sent as a raw `prompt` to
+`<base>/v1/completions` (the compressed text already carries chat-template
+markup, so this avoids double-templating), while uncompressed requests pass
+through to `<base>/v1/chat/completions`. Streaming and non-streaming responses
+are rewritten back to the Chat Completions shape. With no upstream flags the
+server is byte-identical to local-inference mode.
+
+```bash
+./build/dflash_server models/Qwen3.6-27B-Q4_K_M.gguf \
+  --prefill-compression auto --prefill-threshold 10000 \
+  --prefill-drafter models/Qwen3-0.6B-BF16.gguf \
+  --prefill-curve 10000:0.5 40000:0.2 100000:0.1 \
+  --prefill-upstream-base http://127.0.0.1:8099 \
+  --prefill-upstream-model my-upstream-model \
+  --port 8080
+```
+
+New PFlash flags:
+
+| Flag | Purpose |
+|---|---|
+| `--prefill-curve T:R [T:R ...]` | Piecewise keep-ratio curve. Linear interpolation over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression at 10K tokens, 5× at 40K, 10× at 100K+). Overrides `--prefill-keep-ratio`; a per-session bandit override still takes precedence. |
+| `--prefill-upstream-base <URL>` | OpenAI-compatible upstream base URL. Enables proxy mode. |
+| `--prefill-upstream-key <KEY>` | Bearer token sent to the upstream. |
+| `--prefill-upstream-model <NAME>` | Model name sent on forwarded requests. |
+
 Then point OpenAI-compatible clients at `http://127.0.0.1:18080/v1`, or probe
 the server with:
 
@@ -199,6 +230,59 @@ Full `bench_llm.py` suite on Qwen3.6-27B UD-Q4_K_XL, 10 prompts, n_gen=256, RTX 
 | GSM8K | 34.89 | 59.65 | 4.43 | **1.71×** |
 | Math500 | 35.13 | 69.77 | 5.15 | **1.99×** |
 | **Mean** | 34.97 | 69.19 | 5.17 | **1.98×** |
+
+## Hybrid MoE (hot/cold expert split)
+
+For MoE targets whose experts don't fit in VRAM, dflash can split experts
+across the GPU and CPU: the most-used (**hot**) experts stay resident on the
+GPU, the rest (**cold**) live in host RAM and are evaluated on the CPU,
+overlapped with the GPU hot path. This trades some decode/prefill speed for
+VRAM headroom, and is computed automatically at load by a dynamic-placement
+pass. It applies to both MoE arches: `qwen35`/`qwen36` and `laguna`.
+
+**When it triggers.** If the experts fit in the available VRAM budget, all
+experts load to GPU (no split, fastest path). Otherwise placement keeps as
+many hot experts as the budget allows and routes the rest to CPU. You can also
+shrink the budget manually to force a split (e.g. to free VRAM for a longer
+context or a larger target).
+
+### Budget knobs
+
+| Env | Arch | Effect |
+|---|---|---|
+| `DFLASH_EXPERT_BUDGET_MB N` | both | Cap hot-expert VRAM to `N` MB. Applies only when `N` is below the auto-computed budget; experts beyond it go cold (CPU). |
+| `DFLASH_EXPERT_BUDGET_PCT P` | laguna | Keep hot experts to `P`% (`0<P<100`) of total expert bytes. Applies only when below the auto budget. |
+| `DFLASH_MAX_CONTEXT N` | both | Override the max context used when sizing the KV cache (more KV = less VRAM left for hot experts). |
+
+### Placement / tuning knobs (per arch)
+
+Substitute `<ARCH>` = `LAGUNA` or `QWEN35MOE`:
+
+| Env | Effect |
+|---|---|
+| `DFLASH_<ARCH>_HOTNESS <file>` | Expert frequency/hotness file driving which experts are placed hot. |
+| `DFLASH_<ARCH>_TELEMETRY 1` | Log per-layer hot/cold FFN timing telemetry. |
+| `DFLASH_<ARCH>_SWAP_MAX N` | Max hot/cold promotions per request boundary (runtime re-placement); `0` disables swapping. |
+| `DFLASH_<ARCH>_SWAP_MIN_GAIN N` | Min observed-frequency gain before a cold expert is promoted to hot. |
+| `DFLASH_<ARCH>_NEXT_PLACEMENT_OUT <file>` | Dump the placement chosen this run (warm-start the hotness file next time). |
+| `DFLASH_QWEN35MOE_RUNTIME_STATS_OUT <file>` | (qwen only) Dump runtime routing-frequency stats. |
+
+### Example
+
+```bash
+# Force ~8 GB of hot experts on GPU; the rest run cold on the CPU.
+DFLASH_EXPERT_BUDGET_MB=8000 ./build/dflash_server models/laguna-xs2-Q4_K_M.gguf --port 8000
+# Startup log e.g.: "dynamic placement result: 4717 hot experts, 5267 cold experts"
+```
+
+### Caveat: reduced-stack prefill chunking
+
+When a layer's hot-expert stack is **reduced** (i.e. a genuine split), the
+ggml-cuda MMQ `mul_mat_id` kernel illegal-accesses for certain batch sizes on
+**both** HIP/gfx1151 and CUDA/sm_86. As a guard, hybrid-split **prefill** is
+sliced into ≤4-token sub-batches (forcing the stable MMVQ path); **decode**
+(single-token) is unaffected. This costs some prefill throughput on split
+layers and is removed once the kernel is fixed upstream.
 
 ## Laguna-XS.2 target (experimental, Poolside MoE)
 

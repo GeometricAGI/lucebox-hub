@@ -23,6 +23,7 @@
 
 #include "gguf.h"
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +88,12 @@ static bool validate_server_placement(const BackendArgs & bargs,
             "--draft-ipc-bin\n");
         return false;
     }
+    if (!bargs.remote_target_shard.enabled() &&
+        bargs.remote_target_shard.has_aux_options()) {
+        std::fprintf(stderr,
+            "[server] --target-shard-ipc-work-dir requires --target-shard-ipc-bin\n");
+        return false;
+    }
     if (draft_placement_used && target != draft) {
         if (!bargs.remote_draft.enabled()) {
             std::fprintf(stderr,
@@ -136,7 +143,42 @@ static bool validate_server_placement(const BackendArgs & bargs,
             return false;
         }
     }
-    if (bargs.device.is_layer_split() && target != compiled) {
+    const bool mixed_target_split =
+        bargs.device.is_layer_split() && bargs.device.is_mixed_layer_split();
+    if (mixed_target_split) {
+        if (!bargs.remote_target_shard.enabled()) {
+            std::fprintf(stderr,
+                "[server] mixed-backend target layer split requires "
+                "--target-shard-ipc-bin\n");
+            return false;
+        }
+        size_t remote_begin = 0;
+        while (remote_begin < bargs.device.layer_split_gpus.size() &&
+               bargs.device.layer_split_backend(remote_begin) == compiled) {
+            ++remote_begin;
+        }
+        if (remote_begin == 0 || remote_begin >= bargs.device.layer_split_gpus.size()) {
+            std::fprintf(stderr,
+                "[server] mixed-backend target layer split currently supports "
+                "one local backend group followed by one remote backend group\n");
+            return false;
+        }
+        const PlacementBackend remote_backend =
+            bargs.device.layer_split_backend(remote_begin);
+        bool one_boundary = true;
+        for (size_t i = remote_begin; i < bargs.device.layer_split_gpus.size(); ++i) {
+            if (bargs.device.layer_split_backend(i) != remote_backend) {
+                one_boundary = false;
+                break;
+            }
+        }
+        if (!one_boundary) {
+            std::fprintf(stderr,
+                "[server] mixed-backend target layer split currently supports "
+                "only one backend boundary\n");
+            return false;
+        }
+    } else if (bargs.device.is_layer_split() && target != compiled) {
         std::fprintf(stderr,
             "[server] target layer split must use this binary's compiled "
             "backend (target=%s compiled=%s)\n",
@@ -166,6 +208,8 @@ static void print_usage(const char * prog) {
         "  --draft-swa <N>                Draft sliding-window attention size (0=off; e.g.\n"
         "                                 2048 for unsloth Qwen3.6 targets, per server/README.md.\n"
         "                                 Env: DFLASH27B_DRAFT_SWA)\n"
+        "  --target-shard-ipc-bin <path>  Remote target shard IPC daemon for mixed target split\n"
+        "  --target-shard-ipc-work-dir <path>  Remote target shard IPC scratch directory\n"
         "  --target-devices <list>        Reserved layer-split devices, e.g. cuda:0,cuda:1\n"
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
@@ -210,11 +254,23 @@ static void print_usage(const char * prog) {
         "  --prefill-compression off|auto|always  (default: off)\n"
         "  --prefill-threshold <N>     Token threshold for auto mode (default: 32000)\n"
         "  --prefill-keep-ratio <F>    Fraction of tokens to keep (default: 0.05)\n"
+        "  --prefill-curve T:R [T:R ...]  Piecewise keep-ratio curve over\n"
+        "                              (token,ratio) breakpoints; linear interp.\n"
+        "                              Overrides --prefill-keep-ratio. Example:\n"
+        "                              10000:0.5 40000:0.2 100000:0.1\n"
         "  --prefill-drafter <path>    Drafter GGUF for compression (Qwen3-0.6B)\n"
         "  --prefill-skip-park         Skip park/unpark (for >=32GB GPUs)\n"
         "  --draft-residency auto|persistent|request-scoped\n"
         "                         Drafter lifetime policy (default: auto)\n"
         "  --lazy-draft                Legacy alias for --draft-residency=request-scoped\n"
+        "\n"
+        "PFlash upstream proxy (forward compressed prompt to a backend):\n"
+        "  --prefill-upstream-base <URL>   OpenAI-compatible upstream. Compressed\n"
+        "                              requests POST the raw prompt to\n"
+        "                              <URL>/v1/completions; uncompressed pass\n"
+        "                              through to <URL>/v1/chat/completions.\n"
+        "  --prefill-upstream-key <KEY>    Bearer token for the upstream.\n"
+        "  --prefill-upstream-model <NAME> Model name on forwarded requests.\n"
         "\n"
         "Disk KV cache:\n"
         "  --kv-cache-dir <path>       Directory for ondisk KV cache (enables feature)\n"
@@ -315,6 +371,10 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "[server] bad --draft-ipc-ring-cap value\n");
                 return 2;
             }
+        } else if (std::strcmp(argv[i], "--target-shard-ipc-bin") == 0 && i + 1 < argc) {
+            bargs.remote_target_shard.ipc_bin = argv[++i];
+        } else if (std::strcmp(argv[i], "--target-shard-ipc-work-dir") == 0 && i + 1 < argc) {
+            bargs.remote_target_shard.work_dir = argv[++i];
         } else if (std::strcmp(argv[i], "--target-devices") == 0 && i + 1 < argc) {
             if (target_device_seen) {
                 std::fprintf(stderr, "[server] --target-devices conflicts with --target-device\n");
@@ -392,6 +452,30 @@ int main(int argc, char ** argv) {
             sconfig.pflash_drafter_path = argv[++i];
         } else if (std::strcmp(argv[i], "--prefill-skip-park") == 0) {
             sconfig.pflash_skip_park = true;
+        } else if (std::strcmp(argv[i], "--prefill-upstream-base") == 0 && i + 1 < argc) {
+            sconfig.pflash_upstream_base = argv[++i];
+            // Strip trailing slash
+            while (!sconfig.pflash_upstream_base.empty() && sconfig.pflash_upstream_base.back() == '/')
+                sconfig.pflash_upstream_base.pop_back();
+        } else if (std::strcmp(argv[i], "--prefill-upstream-key") == 0 && i + 1 < argc) {
+            sconfig.pflash_upstream_key = argv[++i];
+        } else if (std::strcmp(argv[i], "--prefill-upstream-model") == 0 && i + 1 < argc) {
+            sconfig.pflash_upstream_model = argv[++i];
+        } else if (std::strcmp(argv[i], "--prefill-curve") == 0 && i + 1 < argc) {
+            sconfig.pflash_curve.clear();
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
+                const char * arg = argv[++i];
+                const char * colon = std::strchr(arg, ':');
+                if (!colon) {
+                    std::fprintf(stderr, "[server] --prefill-curve: bad format '%s' (expected TOKENS:RATIO)\n", arg);
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                int tok = std::atoi(arg);
+                float ratio = (float)std::atof(colon + 1);
+                sconfig.pflash_curve.push_back({tok, ratio});
+            }
+            std::sort(sconfig.pflash_curve.begin(), sconfig.pflash_curve.end());
         } else if (std::strcmp(argv[i], "--draft-residency") == 0 && i + 1 < argc) {
             if (!parse_draft_residency_policy(argv[++i], sconfig.draft_residency)) {
                 std::fprintf(stderr,
@@ -562,6 +646,17 @@ int main(int argc, char ** argv) {
                      sconfig.pflash_threshold, sconfig.pflash_keep_ratio,
                      sconfig.pflash_drafter_gpu,
                      (int)sconfig.pflash_skip_park);
+        if (!sconfig.pflash_curve.empty()) {
+            std::fprintf(stderr, "[server] pflash curve:");
+            for (const auto & p : sconfig.pflash_curve)
+                std::fprintf(stderr, " %d:%.3f", p.first, p.second);
+            std::fprintf(stderr, "\n");
+        }
+        if (!sconfig.pflash_upstream_base.empty()) {
+            std::fprintf(stderr, "[server] pflash upstream: %s  model=%s\n",
+                         sconfig.pflash_upstream_base.c_str(),
+                         sconfig.pflash_upstream_model.c_str());
+        }
     }
 
     // Honor DFLASH27B_DRAFT_SWA env (documented in server/README.md) when --draft-swa is absent.
@@ -747,11 +842,20 @@ int main(int argc, char ** argv) {
                  placement_device_name(bargs.device).c_str());
     if (bargs.device.is_layer_split()) {
         std::fprintf(stderr, "[server] │  target_shards   =");
-        for (int gpu : bargs.device.layer_split_gpus) {
+        for (size_t i = 0; i < bargs.device.layer_split_gpus.size(); ++i) {
             std::fprintf(stderr, " %s:%d",
-                         placement_backend_name(bargs.device.backend), gpu);
+                         placement_backend_name(bargs.device.layer_split_backend(i)),
+                         bargs.device.layer_split_gpus[i]);
         }
         std::fprintf(stderr, "\n");
+        if (bargs.remote_target_shard.enabled()) {
+            std::fprintf(stderr, "[server] │  target_shard_ipc= %s\n",
+                         bargs.remote_target_shard.ipc_bin.c_str());
+            if (!bargs.remote_target_shard.work_dir.empty()) {
+                std::fprintf(stderr, "[server] │  target_shard_dir= %s\n",
+                             bargs.remote_target_shard.work_dir.c_str());
+            }
+        }
     }
     std::fprintf(stderr, "[server] │  draft_device    = %s\n",
                  placement_device_name(bargs.draft_device).c_str());

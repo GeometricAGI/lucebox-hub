@@ -57,7 +57,8 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         result.error = "context";
         return result;
     }
-    if (req.do_sample && req.sampler.temp > 0.0f) {
+    if (req.do_sample && req.sampler.needs_logit_processing() &&
+        !adapter_->supports_cpu_sampling()) {
         result.error = "sampling_unsupported";
         return result;
     }
@@ -109,11 +110,13 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
         auto t_decode_start = std::chrono::steady_clock::now();
         const bool use_dflash = !req.force_ar_decode && adapter_->can_dflash_decode();
         if (use_dflash) result.spec_decode_ran = true;
+        float dflash_accept_rate = 0.0f;
         const bool ok = use_dflash
             ? adapter_->decode_dflash(req.prompt, base_pos, last_tok, req.n_gen,
-                                      result.tokens, out_io)
+                                      result.tokens, out_io, dflash_accept_rate)
             : adapter_->decode_ar(last_tok, base_pos + (int)req.prompt.size(), req.n_gen,
                                   result.tokens, out_io);
+        if (use_dflash) result.accept_rate = dflash_accept_rate;
         if (!ok) {
             result.error = "decode";
             return result;
@@ -126,8 +129,8 @@ GenerateResult LayerSplitBackend::run_from_state(const GenerateRequest & req,
     return result;
 }
 
-GenerateResult LayerSplitBackend::generate(const GenerateRequest & req,
-                                           const DaemonIO & io) {
+GenerateResult LayerSplitBackend::generate_impl(const GenerateRequest & req,
+                                                const DaemonIO & io) {
     return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true);
 }
 
@@ -147,7 +150,7 @@ int LayerSplitBackend::snapshot_cur_pos(int slot) const {
     return adapter_ ? adapter_->snapshot_cur_pos(slot) : 0;
 }
 
-GenerateResult LayerSplitBackend::restore_and_generate(
+GenerateResult LayerSplitBackend::restore_and_generate_impl(
         int slot, const GenerateRequest & req, const DaemonIO & io) {
     GenerateResult result;
     if (!adapter_ || !adapter_->snapshot_restore(slot)) {

@@ -2,6 +2,7 @@
 // Not installed, not exposed in the public API.
 
 #pragma once
+#define DFLASH_INTERNAL_H_INCLUDED
 
 #include <cstddef>
 #include <cstdint>
@@ -27,7 +28,7 @@
 
 namespace dflash::common {
 
-struct Qwen35MoeHybridStorage;
+struct MoeHybridStorage;
 
 // Single source of truth for error reporting.
 // All loaders / graph builders push into this via set_last_error(...).
@@ -155,7 +156,7 @@ struct TargetWeights {
     std::vector<TargetLayer> layers;         // size = 64
     ggml_tensor * out_norm = nullptr;        // [hidden]
     ggml_tensor * output   = nullptr;        // [hidden, vocab]  (lm_head)
-    std::shared_ptr<Qwen35MoeHybridStorage> moe_hybrid; // optional Phase 3 hybrid storage
+    std::shared_ptr<MoeHybridStorage> moe_hybrid; // optional hybrid storage (hot/cold expert split)
 
     // Metadata from GGUF (validated at load time)
     int full_attention_interval = 4;
@@ -542,6 +543,8 @@ struct QwenGraphInputs {
     int           fa_window = 0;  // sliding window for FA layers: 0 = full attention
     bool          last_token_logits_only = false; // if true, only compute logits for last token (prefill optimization)
     ggml_tensor * parent_ids = nullptr; // [n_tokens] i32; tree mode when non-null
+    // [n_tokens,n_head_kv] i64; non-null = step-invariant KV write via ggml_set_rows (carries kv_start).
+    ggml_tensor * kv_write_rows = nullptr;
 };
 
 struct QwenGraphOutputs {

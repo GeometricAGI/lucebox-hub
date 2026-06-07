@@ -22,6 +22,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace dflash::common {
 
@@ -34,11 +37,99 @@ static float bf16_bits_to_f32(uint16_t bits) {
     v.u = (uint32_t)bits << 16;
     return v.f;
 }
+
+static bool tokens_contain_recent_sequence(const std::vector<int32_t> & tokens,
+                                           const std::vector<int32_t> & needle,
+                                           size_t max_trailing) {
+    if (needle.empty() || tokens.size() < needle.size()) return false;
+    const size_t last_end = tokens.size();
+    const size_t first_end = std::max(
+        needle.size(),
+        last_end > max_trailing ? last_end - max_trailing : needle.size());
+    for (size_t end = first_end; end <= last_end; ++end) {
+        const size_t start = end - needle.size();
+        if (std::equal(needle.begin(), needle.end(), tokens.begin() + start)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool tokens_have_recent_any(const std::vector<int32_t> & tokens,
+                                   const std::vector<int32_t> & candidates,
+                                   size_t max_trailing) {
+    if (tokens.empty() || candidates.empty()) return false;
+    for (size_t trailing = 0; trailing <= max_trailing; ++trailing) {
+        if (tokens.size() <= trailing) break;
+        const int32_t tok = tokens[tokens.size() - 1 - trailing];
+        if (std::find(candidates.begin(), candidates.end(), tok) != candidates.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int env_int_or_default(const char * name, int fallback) {
+    if (const char * raw = std::getenv(name)) {
+        if (*raw) return std::atoi(raw);
+    }
+    return fallback;
+}
+
+static int dflash_min_tokens_floor() {
+    static const int value = env_int_or_default("DFLASH_MIN_TOKENS", 0);
+    return value;
+}
+
+static FILE * open_dflash_floor_log() {
+    static constexpr const char * kPath = "/tmp/dflash_floor.log";
+    static constexpr off_t kMaxBytes = 1024 * 1024;
+
+    int flags = O_WRONLY | O_CREAT | O_APPEND;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = ::open(kPath, flags, 0600);
+    if (fd < 0) return nullptr;
+
+    struct stat st;
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        ::close(fd);
+        return nullptr;
+    }
+    if (st.st_size > kMaxBytes) {
+#ifdef O_NOFOLLOW
+        if (::ftruncate(fd, 0) != 0) {
+            ::close(fd);
+            return nullptr;
+        }
+#else
+        ::close(fd);
+        return nullptr;
+#endif
+    }
+
+    FILE * out = fdopen(fd, "a");
+    if (!out) ::close(fd);
+    return out;
+}
 }  // namespace
 
 #define IS_EOS_TOK(tok, w)                                         \
     ( ((w).eos_chat_id >= 0 && (tok) == (w).eos_chat_id)                  \
    || ((w).eos_id      >= 0 && (tok) == (w).eos_id     ) )
+
+static bool qwen35_empty_visible_output(const std::vector<int32_t> & tokens,
+                                        const TargetWeights & w) {
+    if (tokens.empty()) return false;
+    for (int32_t tok : tokens) {
+        if (!IS_EOS_TOK(tok, w)) return false;
+    }
+    return true;
+}
 
 // ── Construction / destruction ──────────────────────────────────────────
 
@@ -545,8 +636,8 @@ void Qwen35Backend::release_scratch() {
 
 // ── Generate (speculative decode) ───────────────────────────────────────
 
-GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
-                                        const DaemonIO & io) {
+GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
+                                            const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     sampler_ = req.sampler;
@@ -588,9 +679,17 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens, &req.budget_hook,
+                                       req.hint_tokens,
+                                       req.stall_tool_prefix_tokens,
+                                       req.stall_action_suffix_tokens,
+                                       req.stall_skip_tokens,
+                                       &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
+            if (decode_ok) {
+                result.empty_visible_output =
+                    qwen35_empty_visible_output(result.tokens, w_);
+            }
         }
         if (!decode_ok) {
             result.error = "decode";
@@ -606,9 +705,9 @@ GenerateResult Qwen35Backend::generate(const GenerateRequest & req,
 
 // ── Restore + generate ──────────────────────────────────────────────────
 
-GenerateResult Qwen35Backend::restore_and_generate(int slot,
-                                                    const GenerateRequest & req,
-                                                    const DaemonIO & io) {
+GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
+                                                        const GenerateRequest & req,
+                                                        const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
     if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) {
@@ -689,9 +788,17 @@ GenerateResult Qwen35Backend::restore_and_generate(int slot,
         } else {
             decode_ok = do_spec_decode(committed, req.n_gen, result.tokens, out_io,
                                        result.accept_rate, result.spec_decode_ran,
-                                       req.hint_tokens, &req.budget_hook,
+                                       req.hint_tokens,
+                                       req.stall_tool_prefix_tokens,
+                                       req.stall_action_suffix_tokens,
+                                       req.stall_skip_tokens,
+                                       &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
+            if (decode_ok) {
+                result.empty_visible_output =
+                    qwen35_empty_visible_output(result.tokens, w_);
+            }
         }
         if (!decode_ok) {
             result.error = "decode";
@@ -943,6 +1050,13 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
 
     auto t_dec0_ar = std::chrono::steady_clock::now();
     const size_t out_tokens_at_entry = out_tokens.size();
+    const int _min_floor = dflash_min_tokens_floor();
+    static const int _repeat_guard = []{
+        const int explicit_guard =
+            env_int_or_default("DFLASH_DEGENERATE_RUN_TOKENS", -1);
+        if (explicit_guard >= 0) return explicit_guard;
+        return dflash_min_tokens_floor() > 0 ? 32 : 0;
+    }();
 
     const int hidden = w_.n_embd;
     const int vocab  = w_.n_vocab;
@@ -1002,22 +1116,65 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             return false;
         }
 
+        // Fill kv_write_rows with this step's cache slot (committed) for set_rows.
+        if (sg_.kv_write_rows) {
+            const int n_head_kv = w_.n_head_kv;
+            std::vector<int64_t> row_vals(n_head_kv, (int64_t)committed);
+            ggml_backend_tensor_set(sg_.kv_write_rows, row_vals.data(), 0,
+                                    sizeof(int64_t) * n_head_kv);
+        }
+
         auto st = ggml_backend_graph_compute(target_backend_, sg_.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
 
         after_target_compute(sg_, committed, 1);
 
-        ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
-                                sizeof(float) * vocab);
+        // GPU argmax: read 4 bytes, skip the 970 KB logit D2H. Escape: DFLASH_GPU_ARGMAX=0.
+        static const bool kGpuArgmaxAR = []() {
+            const char * v = std::getenv("DFLASH_GPU_ARGMAX");
+            return v == nullptr || v[0] != '0';
+        }();
         int32_t next_tok;
         if (sampler_.needs_logit_processing()) {
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_,
                                       out_tokens, sampler_rng_);
+        } else if (kGpuArgmaxAR && sg_.argmax_tokens) {
+            int32_t tok_i = 0;
+            ggml_backend_tensor_get(sg_.argmax_tokens, &tok_i, 0, sizeof(int32_t));
+            next_tok = tok_i;
         } else {
+            ggml_backend_tensor_get(sg_.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
             next_tok = 0;
             float best = logits_buf[0];
             for (int j = 1; j < vocab; j++) {
                 if (logits_buf[j] > best) { best = logits_buf[j]; next_tok = j; }
+            }
+        }
+
+        // MIN_TOKENS_BEFORE_EOS (env DFLASH_MIN_TOKENS, default 0=off): if the
+        // model tries to stop before producing N tokens in this decode call,
+        // suppress EOS and take the best NON-eos token instead. Targets the Q4
+        // 'preamble then stop, no tool_call' agentic stall. Env-gated so the
+        // default production lane is byte-for-byte unchanged.
+        {
+            if (_min_floor > 0 && (int)out_tokens.size() < _min_floor && IS_EOS_TOK(next_tok, w_)) {
+                int alt = -1; float altbest = -1e30f;
+                for (int v = 0; v < vocab; v++) {
+                    if (IS_EOS_TOK(v, w_)) continue;
+                    if (logits_buf[v] > altbest) { altbest = logits_buf[v]; alt = v; }
+                }
+                if (alt >= 0) {
+                    // Debug-only diagnostic: writes happen exclusively when the
+                    // operator opts into DFLASH_MIN_TOKENS, so the default
+                    // production lane never touches /tmp/dflash_floor.log.
+                    // Bound the local evidence file before appending.
+                    FILE* _d = open_dflash_floor_log();
+                    if (_d) { std::fprintf(_d, "[floor] eos@%d -> alt=%d\n", (int)out_tokens.size(), alt); std::fclose(_d); }
+                    next_tok = alt;
+                }
             }
         }
 
@@ -1030,6 +1187,22 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         if (io.cancelled) break;
 
         if (IS_EOS_TOK(next_tok, w_)) break;
+
+        if (_repeat_guard > 0 && (int)out_tokens.size() >= _repeat_guard) {
+            int run = 1;
+            for (int j = (int)out_tokens.size() - 2; j >= 0; --j) {
+                if (out_tokens[j] != next_tok) break;
+                run++;
+            }
+            if (run >= _repeat_guard) {
+                std::fprintf(stderr,
+                    "[degenerate-decode] token %d repeated %d times - "
+                    "breaking AR loop at committed=%d\n",
+                    next_tok, run, committed);
+                if (degenerate_close_out) *degenerate_close_out = true;
+                break;
+            }
+        }
 
         // Degenerate-decode watchdog. Once we're past the budget-hook's
         // close sequence (model in post-`</think>` content phase), watch
@@ -1121,6 +1294,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     float & out_accept_rate,
                                     bool & out_spec_ran,
                                     const std::vector<int32_t> * hint_tokens,
+                                    const std::vector<int32_t> * stall_tool_prefix_tokens,
+                                    const std::vector<int32_t> * stall_action_suffix_tokens,
+                                    const std::vector<int32_t> * stall_skip_tokens,
                                     const BudgetHook * budget_hook,
                                     bool * forced_close_out,
                                     bool * degenerate_close_out) {
@@ -1159,6 +1335,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     }
 
     out_spec_ran = true;
+    const int _min_floor = dflash_min_tokens_floor();
 
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
@@ -1227,6 +1404,26 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 io.emit(-1);
                 return ok;
             }
+        }
+
+        if (last_tok < 0 && !out_tokens.empty()) {
+            std::fprintf(stderr,
+                "[spec-decode] invalid draft seed %d after %d emitted tokens; "
+                "switching to AR\n",
+                last_tok, (int)out_tokens.size());
+            step_graph_destroy(draft_sg);
+            cache_.last_tok = out_tokens.back();
+            const int ar_n_gen = n_gen - n_generated;
+            if (ar_n_gen <= 0) {
+                io.emit(-1);
+                return true;
+            }
+            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
+            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
+                                    tail_hook, forced_close_out,
+                                    degenerate_close_out);
+            io.emit(-1);
+            return ok;
         }
 
         // 1. Build noise input for draft
@@ -1368,7 +1565,6 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             step_graph_destroy(draft_sg);
             return false;
         }
-        last_tok = replay_last_tok;
 
         // 7. Sync features for replayed range to mirror (needed for next draft step)
         if (use_remote_draft && cache_.target_feat) {
@@ -1383,17 +1579,95 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
         // 8. Emit committed tokens (stop at EOS)
         bool hit_eos = false;
+        bool floor_to_ar = false;
+        bool inject_tool_prefix = false;
+        constexpr size_t kActionSuffixLookback = 16;
+        constexpr size_t kSkipSequenceLookback = 64;
         int emitted = 0;
         for (int i = 0; i < commit_n; i++) {
+            if (_min_floor > 0 && (int)out_tokens.size() < _min_floor &&
+                IS_EOS_TOK(replay_tok[i], w_)) {
+                // Action preambles often end as "I'll check:\n\n" before EOS.
+                // Tokenization makes the colon several tokens back, so keep a
+                // modest trailing window while still requiring a recent action
+                // suffix token and no nearby completion phrase.
+                const bool can_inject_tool =
+                    stall_tool_prefix_tokens && !stall_tool_prefix_tokens->empty() &&
+                    stall_action_suffix_tokens && !stall_action_suffix_tokens->empty() &&
+                    tokens_have_recent_any(out_tokens, *stall_action_suffix_tokens,
+                                           kActionSuffixLookback) &&
+                    !(stall_skip_tokens &&
+                      tokens_contain_recent_sequence(out_tokens,
+                                                     *stall_skip_tokens,
+                                                     kSkipSequenceLookback));
+                if (can_inject_tool) {
+                    // Debug-only diagnostic, same DFLASH_MIN_TOKENS gating as the
+                    // AR-path floor log above; silent in the default lane.
+                    FILE* _d = open_dflash_floor_log();
+                    if (_d) {
+                        std::fprintf(_d,
+                            "[spec-tool-floor] eos@%d committed=%d emitted=%d prefix=%zu -> ar\n",
+                            (int)out_tokens.size(), committed, emitted,
+                            stall_tool_prefix_tokens->size());
+                        std::fclose(_d);
+                    }
+                    floor_to_ar = true;
+                    inject_tool_prefix = true;
+                    break;
+                }
+            }
             out_tokens.push_back(replay_tok[i]);
             io.emit(replay_tok[i]);
             emitted++;
             if (io.cancelled) break;
             if (IS_EOS_TOK(replay_tok[i], w_)) { hit_eos = true; break; }
         }
-        committed   += emitted;
+        int injected = 0;
+        if (floor_to_ar) {
+            if (!target->restore_kv()) {
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            cache_.cur_pos = committed;
+            if (emitted > 0) {
+                std::vector<int32_t> replay_prefix(replay_tok.begin(),
+                                                   replay_tok.begin() + emitted);
+                int prefix_last_tok = -1;
+                if (!target->verify_batch(replay_prefix, committed,
+                                          prefix_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: floor prefix replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            }
+            committed += emitted;
+            cache_.cur_pos = committed;
+            if (inject_tool_prefix) {
+                int tool_prefix_last_tok = -1;
+                if (!target->verify_batch(*stall_tool_prefix_tokens, committed,
+                                          tool_prefix_last_tok, nullptr)) {
+                    std::fprintf(stderr, "spec-decode: tool prefix replay failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                for (int32_t tok : *stall_tool_prefix_tokens) {
+                    out_tokens.push_back(tok);
+                    io.emit(tok);
+                }
+                injected = (int)stall_tool_prefix_tokens->size();
+                committed += injected;
+                cache_.cur_pos = committed;
+            }
+        } else {
+            // Normal (non-floor) path: carry the replay's last token into the
+            // next draft step. The floor_to_ar path never reaches the next
+            // iteration — it sets cache_.last_tok directly below and returns —
+            // so last_tok is intentionally left untouched when flooring.
+            last_tok = replay_last_tok;
+            committed += emitted;
+        }
         cache_.cur_pos = committed;
-        n_generated += emitted;
+        n_generated += emitted + injected;
         n_accept_sum += std::min(accept_n, emitted);
         n_draft_steps++;
 
@@ -1403,6 +1677,24 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         if (io.cancelled) break;
+        if (floor_to_ar) {
+            step_graph_destroy(draft_sg);
+            cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
+            const int total_draft_pos = std::max(1, n_draft_steps * q_len);
+            out_accept_rate =
+                (float)((double)n_accept_sum / (double)total_draft_pos);
+            const int ar_n_gen = n_gen - n_generated;
+            if (ar_n_gen <= 0) {
+                io.emit(-1);
+                return true;
+            }
+            BudgetHook tail_hook = budget_hook ? *budget_hook : BudgetHook{};
+            bool ok = do_ar_decode(committed, ar_n_gen, out_tokens, io,
+                                    tail_hook, forced_close_out,
+                                    degenerate_close_out);
+            io.emit(-1);
+            return ok;
+        }
         if (hit_eos) break;
     }
 

@@ -89,17 +89,17 @@ public:
     bool unpark(const std::string & what) override;
     bool is_target_parked() const override { return target_parked_; }
 
-    GenerateResult generate(const GenerateRequest & req,
-                            const DaemonIO & io) override;
+    GenerateResult generate_impl(const GenerateRequest & req,
+                                 const DaemonIO & io) override;
 
     bool snapshot_save(int slot) override;
     void snapshot_free(int slot) override;
     bool snapshot_used(int slot) const override;
     int  snapshot_cur_pos(int slot) const override;
 
-    GenerateResult restore_and_generate(int slot,
-                                        const GenerateRequest & req,
-                                        const DaemonIO & io) override;
+    GenerateResult restore_and_generate_impl(int slot,
+                                             const GenerateRequest & req,
+                                             const DaemonIO & io) override;
 
     SnapshotRef snapshot_ref(int slot) const override;
     bool snapshot_adopt(int slot, ggml_context * ctx,
@@ -227,6 +227,9 @@ private:
                         float & out_accept_rate,
                         bool & out_spec_ran,
                         const std::vector<int32_t> * hint_tokens = nullptr,
+                        const std::vector<int32_t> * stall_tool_prefix_tokens = nullptr,
+                        const std::vector<int32_t> * stall_action_suffix_tokens = nullptr,
+                        const std::vector<int32_t> * stall_skip_tokens = nullptr,
                         const BudgetHook * budget_hook = nullptr,
                         bool * forced_close_out = nullptr,
                         bool * degenerate_close_out = nullptr);

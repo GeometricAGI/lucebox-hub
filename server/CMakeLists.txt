@@ -65,6 +65,7 @@ endif()
 if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
     set(GGML_HIP  OFF CACHE BOOL "" FORCE)
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "Enable CUDA graphs for AR-decode replay (lucebox)" FORCE)
     set(DFLASH27B_GGML_BACKEND_TARGET ggml-cuda)
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
@@ -237,6 +238,7 @@ add_library(dflash_common STATIC
     src/laguna/laguna_target_graph.cpp
     src/laguna/laguna_daemon.cpp
     src/laguna/laguna_backend.cpp
+    src/laguna/laguna_layer_split_adapter.cpp
     src/common/backend_ipc.cpp
     src/common/dflash_feature_ring.cpp
     src/common/dflash_capture.cpp
@@ -246,17 +248,22 @@ add_library(dflash_common STATIC
     src/common/dflash_draft_graph.cpp
     src/common/dflash_spec_decode.cpp
     src/common/layer_split_backend.cpp
+    src/common/layer_split_runtime.cpp
     src/qwen35/graph_builders.cpp
     src/qwen35moe/qwen35moe_ffn.cpp
     src/qwen35moe/qwen35moe_backend.cpp
     src/qwen35moe/qwen35moe_daemon.cpp
-    src/qwen35moe/qwen35moe_routing_stats.cpp
-    src/qwen35moe/qwen35moe_expert_placement.cpp
-    src/qwen35moe/qwen35moe_hybrid_storage.cpp
-    src/qwen35moe/qwen35moe_hybrid_ffn_eval.cpp
     src/qwen35moe/qwen35moe_pipelined_decode.cpp
-    src/qwen35moe/qwen35moe_swap_manager.cpp
+    # ── Common MoE hybrid infrastructure ──
+    src/common/moe_hybrid_placement.cpp
+    src/common/moe_hybrid_routing_stats.cpp
+    src/common/moe_hybrid_storage.cpp
+    src/common/moe_hybrid_ffn_eval.cpp
+    src/common/cold_ffn_cpu.cpp
+    src/common/moe_hybrid_swap_manager.cpp
     src/qwen35/layer_split_forward.cpp
+    src/qwen35/qwen35_target_shard_ipc.cpp
+    src/qwen35/qwen35_target_shard_ipc_daemon.cpp
     src/qwen35/layer_split_daemon.cpp
     src/qwen35/qwen35_backend.cpp
     src/qwen35/qwen35_layer_split_adapter.cpp
@@ -522,6 +529,11 @@ target_link_libraries(dflash_common
         ggml-base
         nlohmann_json::nlohmann_json
 )
+# OpenMP for parallel cold FFN kernel (saturate memory bandwidth).
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(dflash_common PRIVATE OpenMP::OpenMP_CXX)
+endif()
 if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
     target_link_libraries(dflash_common PRIVATE hip::host)
 endif()
@@ -637,32 +649,32 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_load_target_laguna.cpp")
         add_executable(smoke_load_target_laguna test/smoke_load_target_laguna.cpp)
         target_include_directories(smoke_load_target_laguna PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_load_target_laguna PRIVATE dflash_common ggml ggml-cuda)
+        target_link_libraries(smoke_load_target_laguna PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_laguna_forward.cpp")
         add_executable(smoke_laguna_forward test/smoke_laguna_forward.cpp)
         target_include_directories(smoke_laguna_forward PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(smoke_laguna_forward PRIVATE dflash_common ggml ggml-cuda)
+        target_link_libraries(smoke_laguna_forward PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_ttft.cpp")
         add_executable(bench_laguna_ttft test/bench_laguna_ttft.cpp)
         target_include_directories(bench_laguna_ttft PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(bench_laguna_ttft PRIVATE dflash_common ggml ggml-cuda)
+        target_link_libraries(bench_laguna_ttft PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_pflash.cpp")
         add_executable(bench_laguna_pflash test/bench_laguna_pflash.cpp)
         target_include_directories(bench_laguna_pflash PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(bench_laguna_pflash PRIVATE dflash_common ggml ggml-cuda)
+        target_link_libraries(bench_laguna_pflash PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bench_laguna_generate.cpp")
         add_executable(bench_laguna_generate test/bench_laguna_generate.cpp)
         target_include_directories(bench_laguna_generate PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(bench_laguna_generate PRIVATE dflash_common ggml ggml-cuda)
+        target_link_libraries(bench_laguna_generate PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_laguna_daemon.cpp")
         add_executable(test_laguna_daemon test/test_laguna_daemon.cpp)
         target_include_directories(test_laguna_daemon PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_laguna_daemon PRIVATE dflash_common ggml ggml-cuda)
+        target_link_libraries(test_laguna_daemon PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_target_forward.cpp")
         add_executable(smoke_target_forward test/smoke_target_forward.cpp)
@@ -706,25 +718,30 @@ if(DFLASH27B_TESTS)
 
     # ─── dflash_server: native C++ HTTP server ─────────────────────────
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/server/server_main.cpp")
-        add_executable(dflash_server
-            src/server/server_main.cpp
-            src/server/http_server.cpp
-            src/server/model_card.cpp
-        )
-        target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
-            target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+        find_package(CURL QUIET)
+        if(NOT CURL_FOUND)
+            message(WARNING "CURL not found — skipping dflash_server (passthrough proxy disabled)")
         else()
-            target_compile_definitions(dflash_server PRIVATE
-                DFLASH27B_BACKEND_CUDA=1
-                DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
-        endif()
-        target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread)
-        if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
-            find_package(CUDAToolkit REQUIRED)
-            target_link_libraries(dflash_server PRIVATE CUDA::cudart)
-        else()
-            target_link_libraries(dflash_server PRIVATE hip::host)
+            add_executable(dflash_server
+                src/server/server_main.cpp
+                src/server/http_server.cpp
+                src/server/model_card.cpp
+            )
+            target_include_directories(dflash_server PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
+            if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
+                target_compile_definitions(dflash_server PRIVATE DFLASH27B_BACKEND_HIP=1 GGML_USE_HIP)
+            else()
+                target_compile_definitions(dflash_server PRIVATE
+                    DFLASH27B_BACKEND_CUDA=1
+                    DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
+            endif()
+            target_link_libraries(dflash_server PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} pthread CURL::libcurl)
+            if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
+                find_package(CUDAToolkit REQUIRED)
+                target_link_libraries(dflash_server PRIVATE CUDA::cudart)
+            else()
+                target_link_libraries(dflash_server PRIVATE hip::host)
+            endif()
         endif()
 
         # Copy share/status.html next to the binary so it can be found at runtime.
@@ -785,7 +802,7 @@ if(DFLASH27B_TESTS)
     # ─── Unit tests (no GPU, no model files) ────────────────────────────
     enable_testing()
 
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_server_unit.cpp" AND CURL_FOUND)
         add_executable(test_server_unit test/test_server_unit.cpp)
         target_sources(test_server_unit PRIVATE
             src/server/http_server.cpp
@@ -798,7 +815,7 @@ if(DFLASH27B_TESTS)
                 DFLASH27B_BACKEND_CUDA=1
                 DFLASH27B_CUDA_MIN_SM=${_dflash_cuda_min_sm})
         endif()
-        target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET})
+        target_link_libraries(test_server_unit PRIVATE dflash_common ggml ${DFLASH27B_GGML_BACKEND_TARGET} CURL::libcurl)
         if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
             find_package(CUDAToolkit REQUIRED)
             target_link_libraries(test_server_unit PRIVATE CUDA::cudart)
@@ -809,11 +826,18 @@ if(DFLASH27B_TESTS)
     endif()
 
     # 'make check' — builds test targets then runs ctest
-    add_custom_target(check
-        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-        DEPENDS test_server_unit
-        COMMENT "Building and running unit tests"
-    )
+    if(TARGET test_server_unit)
+        add_custom_target(check
+            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+            DEPENDS test_server_unit
+            COMMENT "Building and running unit tests"
+        )
+    else()
+        add_custom_target(check
+            COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+            COMMENT "Building and running unit tests (server unit tests skipped — CURL not found)"
+        )
+    endif()
 
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     # internal.h includes <cuda_runtime.h> when GGML_USE_CUDA is set; link

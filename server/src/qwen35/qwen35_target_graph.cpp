@@ -441,6 +441,8 @@ static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
 // (shape [head_dim, max_ctx, n_head_kv] f16). We write the new K/V for
 // `n_tokens` new positions starting at `kv_start`, then run causal attention
 // over [0..kv_start + n_tokens).
+//
+// kv_write_rows: non-null selects the step-invariant ggml_set_rows KV write; null = legacy ggml_cpy.
 static ggml_tensor * build_full_attn_block(
     ggml_context * ctx,
     ggml_cgraph * gf,
@@ -459,7 +461,8 @@ static ggml_tensor * build_full_attn_block(
     bool kv_k_rotated = false,
     int fa_window = 0,
     ggml_tensor * q_tail_capture = nullptr,
-    int q_tail_start = 0
+    int q_tail_start = 0,
+    ggml_tensor * kv_write_rows = nullptr
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -539,38 +542,37 @@ static ggml_tensor * build_full_attn_block(
     //
     // cache_k is [head_dim, max_ctx, n_head_kv]. We want to copy Kcur
     // [head_dim, n_head_kv, n_tokens] into cache_k[:, kv_start:kv_start+n_tokens, :].
-    //
-    // Easiest: transpose Kcur to [head_dim, n_tokens, n_head_kv] so its axes
-    // line up with cache_k's [head_dim, max_ctx, n_head_kv], then view a slice
-    // of cache_k and copy.
     ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
     ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
 
-    // Graph-level FWHT rotation: rotate K before writing to standard-type
-    // cache. This spreads outliers across dimensions (like TurboQuant) while
-    // keeping Q4_0/Q8_0 cache types that have fast FA kernels on all arches.
-    // turbo_wht handles strided (non-contiguous) input directly, so we skip
-    // the ggml_cont that permute would otherwise require.
+    // Graph-level FWHT rotation: rotate K before writing to standard-type cache.
     if (kv_k_rotated) {
         Kcur_T = ggml_turbo_wht(ctx, Kcur_T, 0);
     }
 
-    ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
-        head_dim, n_tokens, n_head_kv,
-        cache_k->nb[1], cache_k->nb[2],
-        /*offset*/ cache_k->nb[1] * kv_start);
-    ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
-        head_dim, n_tokens, n_head_kv,
-        cache_v->nb[1], cache_v->nb[2],
-        cache_v->nb[1] * kv_start);
-
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+    if (kv_write_rows) {
+        // Step-invariant: constant dst pointer, idx carries kv_start. set_rows needs contiguous src.
+        ggml_tensor * Kcur_cont = ggml_is_contiguous(Kcur_T) ? Kcur_T : ggml_cont(ctx, Kcur_T);
+        ggml_tensor * Vcur_cont = ggml_is_contiguous(Vcur_T) ? Vcur_T : ggml_cont(ctx, Vcur_T);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_cont, kv_write_rows));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vcur_cont, kv_write_rows));
+    } else {
+        // Legacy: kv_start as literal view offset (not step-invariant; prefill/verify/non-graph).
+        ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
+            head_dim, n_tokens, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2],
+            /*offset*/ cache_k->nb[1] * kv_start);
+        ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
+            head_dim, n_tokens, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2],
+            cache_v->nb[1] * kv_start);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+    }
 
     // ── Flash attention over the valid slice
-    // When fa_window > 0 and kv_start >= fa_window, only attend to the last
-    // fa_window positions. This dramatically reduces FA cost during speculative
-    // decode verify/replay at long contexts (60K+ kv entries).
+    // fa_window > 0: attend only to the last fa_window positions (cuts FA cost
+    // during spec-decode verify at long contexts).
     const int win_start = (fa_window > 0 && kv_start > fa_window)
                               ? (kv_start - fa_window) : 0;
     const int kv_len = kv_start + n_tokens;
@@ -885,7 +887,7 @@ after_delta_net:
 
     // ── Gated output norm: rms_norm(output) * silu(z_4d)
     ggml_tensor * z_4d = ggml_reshape_4d(ctx, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-    ggml_tensor * output_n = ggml_rms_norm(ctx, output, w.rms_eps);
+    ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
     output_n = ggml_mul(ctx, output_n, L.ssm_norm);
     ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
     output_n = ggml_mul(ctx, output_n, z_silu);
@@ -931,8 +933,9 @@ static ggml_tensor * build_single_layer(
     const int * CAPTURE_LAYERS = w.capture_layer_ids;
     const int N_CAPTURE = w.n_capture_layers;
 
-    ggml_tensor * inpSA = inp;
-    ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
+    ggml_tensor * inpSA = inp_f32;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
     if (is_attn) {
         int fa_idx = 0;
@@ -1047,10 +1050,11 @@ QwenGraphOutputs build_qwen35_graph(
         const TargetLayer & L = w.layers[il];
         const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
 
-        ggml_tensor * inpSA = inpL;
+        ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inpL);
+        ggml_tensor * inpSA = inp_f32;
 
         // Pre-attention norm
-        ggml_tensor * cur = rms_norm_mul(ctx, inpL, L.attn_norm, eps);
+        ggml_tensor * cur = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
         if (is_attn) {
             cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
@@ -1058,7 +1062,10 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.attn_mask, in.kv_start, n_tokens,
                                         cache.kv_k_type, cache.kv_v_type,
                                         cache.kv_k_rotated,
-                                        in.fa_window);
+                                        in.fa_window,
+                                        /*q_tail_capture=*/nullptr,
+                                        /*q_tail_start=*/0,
+                                        in.kv_write_rows);
             fa_idx++;
         } else {
             DeltaNetCapture * cap_ptr = nullptr;
@@ -1230,8 +1237,9 @@ QwenLayerPrefnOutputs build_qwen35_layer_prefn(
     const TargetLayer & L = w.layers[layer_idx];
     const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
 
-    ggml_tensor * inpSA = inp;
-    ggml_tensor * cur   = rms_norm_mul(ctx, inp, L.attn_norm, eps);
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
+    ggml_tensor * inpSA = inp_f32;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
 
     if (is_attn) {
         int fa_idx = 0;

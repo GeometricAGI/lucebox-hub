@@ -1,5 +1,9 @@
 #include "qwen35moe_backend.h"
 
+#include "../common/moe_hybrid_placement.h"
+#include "../common/moe_hybrid_types.h"
+#include "../common/moe_hybrid_types_impl.h"
+#include "common/ggml_graph_precision.h"
 #include "common/sampler.h"
 #include "common/dflash_spec_decode.h"
 #include "dflash_draft_graph.h"
@@ -44,8 +48,8 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
     }
 
     if (const char * stats_path = std::getenv("DFLASH_QWEN35MOE_RUNTIME_STATS_OUT")) {
-        routing_stats_ = std::make_shared<Qwen35MoeRoutingStats>();
-        if (!routing_stats_->init_from_weights(out)) {
+        routing_stats_ = std::make_shared<MoeHybridRoutingStats>();
+        if (!routing_stats_->init(out.n_layer, out.n_expert, out.n_expert_used)) {
             set_last_error("qwen35moe runtime stats init failed");
             return false;
         }
@@ -54,7 +58,7 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
 
     // Phase 2: Compute dynamic placement based on VRAM budget.
     // Expert tensor metadata (ne/nb) is valid even without GPU allocation.
-    Qwen35MoeExpertPlacement placement;
+    MoeHybridPlacement placement;
     std::string placement_source;
     std::string err;
 
@@ -139,8 +143,13 @@ bool Qwen35MoeBackend::load_target_model(ggml_backend_t backend, TargetWeights &
             layer_file_data[(size_t)il].gate_up_exps = find_tensor_data("ffn_gate_up_exps");
         }
 
-        auto hybrid = std::make_shared<Qwen35MoeHybridStorage>();
-        if (!build_qwen35moe_hybrid_storage_from_file(out, backend, placement, layer_file_data, *hybrid, &err)) {
+        auto hybrid = std::make_shared<MoeHybridStorage>();
+        MoeHybridConfig hybrid_cfg = make_moe_hybrid_config(out);
+        std::vector<MoeLayerDesc> layer_descs((size_t)out.n_layer);
+        for (int il = 0; il < out.n_layer; ++il) {
+            layer_descs[(size_t)il] = make_moe_layer_desc(out.layers[(size_t)il]);
+        }
+        if (!build_moe_hybrid_storage_from_file(hybrid_cfg, backend, placement, layer_descs, layer_file_data, *hybrid, &err)) {
             ::munmap(mmap_addr, file_size);
             gguf_free(gctx);
             set_last_error(std::string("qwen35moe hybrid storage build failed: ") + err);
@@ -218,24 +227,29 @@ void Qwen35MoeBackend::maybe_post_request_swap() {
 
     if (!target_weights().moe_hybrid || swap_policy_.max_swaps_total <= 0) return;
 
-    Qwen35MoeSwapPlan plan;
+    MoeHybridSwapPlan plan;
     std::string err;
-    if (!build_qwen35moe_swap_plan(target_weights().moe_hybrid->placement, *routing_stats_,
+    if (!build_moe_hybrid_swap_plan(target_weights().moe_hybrid->placement, *routing_stats_,
                                    swap_policy_, plan, &err)) {
         std::fprintf(stderr, "[qwen35moe] swap plan failed: %s\n", err.c_str());
         return;
     }
     if (plan.actions.empty()) return;
 
-    auto rebuilt = std::make_shared<Qwen35MoeHybridStorage>();
-    if (!build_qwen35moe_hybrid_storage(target_weights(), target_backend(),
-                                        plan.next_placement, *rebuilt, &err)) {
+    auto rebuilt = std::make_shared<MoeHybridStorage>();
+    MoeHybridConfig swap_cfg = make_moe_hybrid_config(target_weights());
+    std::vector<MoeLayerDesc> swap_descs((size_t)target_weights().n_layer);
+    for (int il = 0; il < target_weights().n_layer; ++il) {
+        swap_descs[(size_t)il] = make_moe_layer_desc(target_weights().layers[(size_t)il]);
+    }
+    if (!build_moe_hybrid_storage(swap_cfg, target_backend(),
+                                        plan.next_placement, swap_descs, *rebuilt, &err)) {
         std::fprintf(stderr, "[qwen35moe] swap rebuild failed: %s\n", err.c_str());
         return;
     }
     target_weights().moe_hybrid = std::move(rebuilt);
     if (!placement_out_path_.empty()) {
-        if (!plan.next_placement.save_json(placement_out_path_, &err)) {
+        if (!plan.next_placement.save_json(placement_out_path_, "qwen35moe", &err)) {
             std::fprintf(stderr, "[qwen35moe] failed to save next placement: %s\n", err.c_str());
         }
     }
@@ -259,7 +273,8 @@ bool Qwen35MoeBackend::ensure_pipe_state(int kv_start) {
     if (pipe_state_ && pipe_state_->valid()) return true;
     pipe_state_ = std::make_unique<PipelinedDecodeState>();
     if (!init_pipelined_decode_state(*pipe_state_, target_backend(), target_weights(),
-                                     target_cache(), kv_start, cfg_.kq_stride_pad)) {
+                                     target_cache(), *target_weights().moe_hybrid,
+                                     kv_start, cfg_.kq_stride_pad)) {
         pipe_state_.reset();
         return false;
     }
@@ -274,7 +289,17 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
     std::vector<float> logits_buf((size_t)vocab);
     std::vector<float> act_cur((size_t)hidden);
 
-    // Persistent logits graph (built once, reused per token)
+    // Telemetry accumulators for the full decode loop
+    using DecodeClock = std::chrono::steady_clock;
+    uint64_t tel_embed_us = 0;
+    uint64_t tel_layers_us = 0;
+    uint64_t tel_logits_us = 0;
+    uint64_t tel_sample_us = 0;
+    PipelinedDecodeTelemetry tel_layers_accum{};
+    int tel_n_tokens = 0;
+
+    // Persistent logits graph (built once, reused per token).
+    // Precision policy (#310): keep the rms-norm input and out_norm in f32.
     StepGraph logits_sg;
     auto project_logits = [&]() -> bool {
         if (!logits_sg.ctx) {
@@ -286,8 +311,13 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             logits_sg.hidden_input = ggml_new_tensor_3d(logits_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
             ggml_set_input(logits_sg.hidden_input);
             logits_sg.gf = ggml_new_graph_custom(logits_sg.ctx, 1024, false);
-            ggml_tensor * normed = ggml_rms_norm(logits_sg.ctx, logits_sg.hidden_input, target_weights().rms_eps);
-            normed = ggml_mul(logits_sg.ctx, normed, target_weights().out_norm);
+            ggml_tensor * normed = ggml_rms_norm(
+                logits_sg.ctx,
+                rms_norm_input_f32(logits_sg.ctx, logits_sg.hidden_input),
+                target_weights().rms_eps);
+            normed = ggml_mul(
+                logits_sg.ctx, normed,
+                graph_tensor_f32(logits_sg.ctx, target_weights().out_norm));
             logits_sg.logits = ggml_mul_mat(logits_sg.ctx, target_weights().output, normed);
             ggml_set_output(logits_sg.logits);
             ggml_build_forward_expand(logits_sg.gf, logits_sg.logits);
@@ -297,7 +327,9 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
                 return false;
             }
         }
-        ggml_backend_tensor_set(logits_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        // GPU→GPU: pipe act_cur directly into logits graph (no host bounce)
+        ggml_backend_tensor_copy_async(target_backend(), target_backend(),
+                                       pipe_state_->gpu_state.act_cur, logits_sg.hidden_input);
         auto st = ggml_backend_graph_compute(target_backend(), logits_sg.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
         ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
@@ -312,7 +344,7 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
             ggml_backend_tensor_get(target_step_graph().logits, logits_buf.data(),
                                     prefill_logits_offset(), sizeof(float) * (size_t)vocab);
             first_tok = sample_logits(logits_buf.data(), vocab, sampler_config(),
-                                      out_tokens, sampler_rng_engine());
+                                     out_tokens, sampler_rng_engine());
         } else {
             first_tok = target_cache().last_tok;
         }
@@ -329,30 +361,36 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
     }
 
     for (int step = 1; step < n_gen; ++step) {
+        const auto tok_t0 = DecodeClock::now();
+
         int32_t tok = out_tokens.back();
         if (!target_weights().embedder.embed(&tok, 1, act_cur.data())) {
             return false;
         }
-        ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                sizeof(float) * (size_t)hidden);
+        ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur,
+                                      act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        const auto embed_done = DecodeClock::now();
 
+        PipelinedDecodeTelemetry tel;
         if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
-                                        target_cache(), *target_weights().moe_hybrid,
-                                        committed, cfg_.kq_stride_pad, nullptr)) {
+                                       target_cache(), *target_weights().moe_hybrid,
+                                       committed, cfg_.kq_stride_pad,
+                                       hybrid_telemetry_ ? &tel : nullptr)) {
             return false;
         }
+        const auto layers_done = DecodeClock::now();
 
-        ggml_backend_tensor_get(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                sizeof(float) * (size_t)hidden);
+        // act_cur stays on GPU — project_logits reads it via GPU→GPU copy
         if (!project_logits()) {
             step_graph_destroy(logits_sg);
             return false;
         }
+        const auto logits_done = DecodeClock::now();
 
         int32_t next_tok;
         if (sampler_config().temp > 0) {
             next_tok = sample_logits(logits_buf.data(), vocab, sampler_config(),
-                                     out_tokens, sampler_rng_engine());
+                                    out_tokens, sampler_rng_engine());
         } else {
             next_tok = 0;
             float best = logits_buf[0];
@@ -363,6 +401,48 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
                 }
             }
         }
+        const auto sample_done = DecodeClock::now();
+
+        if (hybrid_telemetry_) {
+            auto us = [](DecodeClock::time_point a, DecodeClock::time_point b) -> uint64_t {
+                return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+            };
+            tel_embed_us += us(tok_t0, embed_done);
+            tel_layers_us += us(embed_done, layers_done);
+            tel_logits_us += us(layers_done, logits_done);
+            tel_sample_us += us(logits_done, sample_done);
+            tel_n_tokens++;
+            // Accumulate per-layer telemetry
+            tel_layers_accum.total_us += tel.total_us;
+            tel_layers_accum.prefn_graph_build_us += tel.prefn_graph_build_us;
+            tel_layers_accum.prefn_compute_us += tel.prefn_compute_us;
+            tel_layers_accum.routing_readback_us += tel.routing_readback_us;
+            tel_layers_accum.ffn_us += tel.ffn_us;
+            tel_layers_accum.ffn_allhot_us += tel.ffn_allhot_us;
+            tel_layers_accum.ffn_mixed_us += tel.ffn_mixed_us;
+            tel_layers_accum.gpu_idle_us += tel.gpu_idle_us;
+            tel_layers_accum.tensor_io_us += tel.tensor_io_us;
+            tel_layers_accum.combine_overhead_us += tel.combine_overhead_us;
+            tel_layers_accum.cold_cpu_us += tel.cold_cpu_us;
+            tel_layers_accum.cold_compute_us += tel.cold_compute_us;
+            tel_layers_accum.hot_graph_build_us += tel.hot_graph_build_us;
+            tel_layers_accum.ffn_post_get_us += tel.ffn_post_get_us;
+            tel_layers_accum.sync_wait_us += tel.sync_wait_us;
+            tel_layers_accum.allhot_layers += tel.allhot_layers;
+            tel_layers_accum.mixed_layers += tel.mixed_layers;
+            tel_layers_accum.total_layers += tel.total_layers;
+            tel_layers_accum.hot_graph_rebuilds += tel.hot_graph_rebuilds;
+            tel_layers_accum.routed_ffn_layers += tel.routed_ffn_layers;
+            tel_layers_accum.routed_prefn_us += tel.routed_prefn_us;
+            tel_layers_accum.routed_sync_us += tel.routed_sync_us;
+            tel_layers_accum.routed_readback_us += tel.routed_readback_us;
+            tel_layers_accum.routed_cpu_remap_us += tel.routed_cpu_remap_us;
+            tel_layers_accum.routed_ffn_dispatch_us += tel.routed_ffn_dispatch_us;
+            tel_layers_accum.routed_final_sync_us += tel.routed_final_sync_us;
+            tel_layers_accum.routed_cold_expert_hits += tel.routed_cold_expert_hits;
+            tel_layers_accum.routed_total_expert_slots += tel.routed_total_expert_slots;
+        }
+
         out_tokens.push_back(next_tok);
         io.emit(next_tok);
         committed++;
@@ -371,14 +451,66 @@ bool Qwen35MoeBackend::run_pipelined_decode_path(int committed, int n_gen,
         if (is_eos_tok(next_tok, target_weights())) break;
     }
 
+    // ── Print decode telemetry ──
+    if (hybrid_telemetry_ && tel_n_tokens > 0) {
+        const double total_us = (double)(tel_embed_us + tel_layers_us + tel_logits_us + tel_sample_us);
+        std::printf("[qwen35moe-ar] === AR DECODE TELEMETRY (n_tokens=%d, %.1f tok/s) ===\n",
+                    tel_n_tokens, tel_n_tokens / (total_us / 1e6));
+        std::printf("  per-token breakdown:\n");
+        std::printf("    embed=%.2fms  layers=%.2fms  logits=%.2fms  sample=%.2fms\n",
+                    tel_embed_us / 1000.0 / tel_n_tokens,
+                    tel_layers_us / 1000.0 / tel_n_tokens,
+                    tel_logits_us / 1000.0 / tel_n_tokens,
+                    tel_sample_us / 1000.0 / tel_n_tokens);
+        std::printf("  time budget: embed=%.1f%% layers=%.1f%% logits=%.1f%% sample=%.1f%%\n",
+                    100.0 * tel_embed_us / total_us,
+                    100.0 * tel_layers_us / total_us,
+                    100.0 * tel_logits_us / total_us,
+                    100.0 * tel_sample_us / total_us);
+        // Routed path breakdown (the dominant path)
+        if (tel_layers_accum.routed_ffn_layers > 0) {
+            const int rl = tel_layers_accum.routed_ffn_layers;
+            std::printf("  routed FFN path (%d layer-evals, %d cold_hits / %d slots = %.1f%% cold):\n",
+                        rl,
+                        tel_layers_accum.routed_cold_expert_hits,
+                        tel_layers_accum.routed_total_expert_slots,
+                        tel_layers_accum.routed_total_expert_slots > 0
+                            ? 100.0 * tel_layers_accum.routed_cold_expert_hits / tel_layers_accum.routed_total_expert_slots
+                            : 0.0);
+            std::printf("    per-layer avg: prefn_dispatch=%.1fus sync_stall=%.1fus readback=%.1fus remap=%.1fus ffn_dispatch=%.1fus\n",
+                        (double)tel_layers_accum.routed_prefn_us / rl,
+                        (double)tel_layers_accum.routed_sync_us / rl,
+                        (double)tel_layers_accum.routed_readback_us / rl,
+                        (double)tel_layers_accum.routed_cpu_remap_us / rl,
+                        (double)tel_layers_accum.routed_ffn_dispatch_us / rl);
+            std::printf("    total: sync_stall=%.1fms (%.1f%% of layers time)\n",
+                        tel_layers_accum.routed_sync_us / 1000.0,
+                        100.0 * tel_layers_accum.routed_sync_us / (double)tel_layers_us);
+            std::printf("    final_sync=%.1fms (%.1f%% of layers time)\n",
+                        tel_layers_accum.routed_final_sync_us / 1000.0,
+                        100.0 * tel_layers_accum.routed_final_sync_us / (double)tel_layers_us);
+        }
+        // Split path stats (if any)
+        if (tel_layers_accum.mixed_layers > 0) {
+            std::printf("  split path: mixed=%d layers, cold_cpu=%.1fms, ffn_mixed=%.1fms\n",
+                        tel_layers_accum.mixed_layers,
+                        tel_layers_accum.cold_cpu_us / 1000.0,
+                        tel_layers_accum.ffn_mixed_us / 1000.0);
+        }
+        std::printf("  split path allhot=%d layers, hot_graph_rebuilds=%d\n",
+                    tel_layers_accum.allhot_layers - tel_layers_accum.routed_ffn_layers,
+                    tel_layers_accum.hot_graph_rebuilds);
+        std::fflush(stdout);
+    }
+
     step_graph_destroy(logits_sg);
     return true;
 }
 
-GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
+GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
                                           const DaemonIO & io) {
     if (!target_weights().moe_hybrid) {
-        auto result = Qwen35Backend::generate(req, io);
+        auto result = Qwen35Backend::generate_impl(req, io);
         if (result.ok) maybe_post_request_swap();
         return result;
     }
@@ -417,7 +549,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
 
     const int n_layer = target_weights().n_layer;
     uint64_t build_us_total = 0, compute_us_total = 0, readback_us_total = 0, ffn_us_total = 0;
-    Qwen35MoeHybridFfnTelemetry ffn_tel_accum{};
+    MoeHybridFfnTelemetry ffn_tel_accum{};
 
     StepGraph logits_sg;  // Persistent logits graph (used by spec-decode branch)
 
@@ -426,7 +558,7 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     };
 
     // Helper: compute logits from act_cur (persistent graph, built once)
-    auto compute_logits = [&]() -> bool {
+    auto compute_logits = [&](ggml_tensor* gpu_src = nullptr) -> bool {
         if (!logits_sg.ctx) {
             // First call: build the logits graph
             ggml_init_params ip{};
@@ -438,8 +570,13 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             logits_sg.hidden_input = ggml_new_tensor_3d(logits_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
             ggml_set_input(logits_sg.hidden_input);
             logits_sg.gf = ggml_new_graph_custom(logits_sg.ctx, 1024, false);
-            ggml_tensor * normed = ggml_rms_norm(logits_sg.ctx, logits_sg.hidden_input, target_weights().rms_eps);
-            normed = ggml_mul(logits_sg.ctx, normed, target_weights().out_norm);
+            ggml_tensor * normed = ggml_rms_norm(
+                logits_sg.ctx,
+                rms_norm_input_f32(logits_sg.ctx, logits_sg.hidden_input),
+                target_weights().rms_eps);
+            normed = ggml_mul(
+                logits_sg.ctx, normed,
+                graph_tensor_f32(logits_sg.ctx, target_weights().out_norm));
             logits_sg.logits = ggml_mul_mat(logits_sg.ctx, target_weights().output, normed);
             ggml_set_output(logits_sg.logits);
             ggml_build_forward_expand(logits_sg.gf, logits_sg.logits);
@@ -449,7 +586,13 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 return false;
             }
         }
-        ggml_backend_tensor_set(logits_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        if (gpu_src) {
+            // GPU→GPU: pipe act_cur directly without host bounce
+            ggml_backend_tensor_copy_async(target_backend(), target_backend(),
+                                            gpu_src, logits_sg.hidden_input);
+        } else {
+            ggml_backend_tensor_set(logits_sg.hidden_input, act_cur.data(), 0, sizeof(float) * (size_t)hidden);
+        }
         auto st = ggml_backend_graph_compute(target_backend(), logits_sg.gf);
         if (st != GGML_STATUS_SUCCESS) return false;
         ggml_backend_tensor_get(logits_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
@@ -474,9 +617,12 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     }
 
     // Process layer by layer, chunked within each layer
+    StepGraph prefill_sg;  // persistent across layers to reuse GPU buffer
+    ggml_gallocr_t ffn_hot_alloc = nullptr;
+    ggml_gallocr_t ffn_cold_alloc = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         auto & storage = target_weights().moe_hybrid->layers[(size_t)il];
-        const auto & L = target_weights().layers[(size_t)il];
 
         for (int chunk_start = 0; chunk_start < prompt_len; chunk_start += prefill_chunk) {
             const int chunk_len = std::min(prefill_chunk, prompt_len - chunk_start);
@@ -485,12 +631,14 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             const bool with_mask = (cfg_.kq_stride_pad > KQ_MASK_PAD) || (chunk_len > 1);
 
             // Build pre-FFN graph for this chunk
-            StepGraph prefill_sg;
+            step_graph_free(prefill_sg);  // reset ctx/graph but keep gallocr buffer
             if (!build_layer_prefn_step(prefill_sg, target_weights(), target_cache(), target_backend(),
                                         il, /*kv_start=*/chunk_start, /*n_tokens=*/chunk_len,
                                         with_mask, /*fa_window=*/0, cfg_.kq_stride_pad)) {
                 result.error = "prefill_build";
                 step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
                 cleanup_graphs();
                 return result;
             }
@@ -531,6 +679,8 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             if (st != GGML_STATUS_SUCCESS) {
                 result.error = "prefill_compute";
                 step_graph_destroy(prefill_sg);
+                if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
                 cleanup_graphs();
                 return result;
             }
@@ -570,33 +720,43 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                 }
             }
 
-            // Batched hybrid FFN for this chunk.
-            // The routed-expert mul_mat_id MMQ kernel writes out of bounds on
-            // Ampere when the per-call token count exceeds ~8: the expert token
-            // distribution overshoots the destination tiles on the
-            // need_check=false write path, silently corrupting neighbouring GPU
-            // allocations during prefill and crashing with an illegal memory
-            // access at a later decode sync (~4th request under the server).
-            // Sub-batch the FFN to a safe width so the attention prefill can
-            // stay at the full chunk size.
-            std::vector<float> ffn_batch_out((size_t)chunk_len * (size_t)hidden);
-            constexpr int kFfnSafeBatch = 8;
-            for (int fb = 0; fb < chunk_len; fb += kFfnSafeBatch) {
-                const int fl = std::min(kFfnSafeBatch, chunk_len - fb);
-                std::vector<float> sub_out;
-                if (!eval_qwen35moe_hybrid_ffn_batched(
-                        target_backend(), cpu_be, target_weights(), L, storage,
-                        chunk_post.data()     + (size_t)fb * (size_t)hidden,
-                        chunk_selected.data() + (size_t)fb * (size_t)n_expert_used,
-                        chunk_weights.data()  + (size_t)fb * (size_t)n_expert_used,
-                        fl, sub_out, &result.error)) {
-                    step_graph_destroy(prefill_sg);
-                    cleanup_graphs();
-                    return result;
+            // Hybrid FFN — skip batched path when cold experts exist (CUDA mul_mat_id bug on sm_75)
+            MoeHybridConfig chunk_cfg = make_moe_hybrid_config(target_weights());
+            MoeLayerDesc chunk_desc = make_moe_layer_desc(target_weights().layers[(size_t)il]);
+            std::vector<float> ffn_batch_out;
+            bool ffn_ok = false;
+            if (storage.cold_expert_ids.empty()) {
+                // All experts hot — safe to use batched path
+                ffn_ok = eval_moe_hybrid_ffn_batched(
+                        target_backend(), cpu_be, chunk_cfg, chunk_desc, storage,
+                        chunk_post.data(),
+                        chunk_selected.data(),
+                        chunk_weights.data(),
+                        chunk_len, ffn_batch_out, &result.error,
+                        &ffn_hot_alloc, &ffn_cold_alloc);
+            }
+            if (!ffn_ok) {
+                // Per-token fallback (avoids sm_75 mul_mat_id assertion with cold experts)
+                result.error.clear();
+                ffn_batch_out.assign((size_t)hidden * (size_t)chunk_len, 0.0f);
+                std::vector<float> single_out;
+                for (int ti = 0; ti < chunk_len; ++ti) {
+                    const float * tok_post = chunk_post.data() + (size_t)ti * (size_t)hidden;
+                    const int32_t * tok_sel = chunk_selected.data() + (size_t)ti * (size_t)n_expert_used;
+                    const float * tok_wts = chunk_weights.data() + (size_t)ti * (size_t)n_expert_used;
+                    if (!eval_moe_hybrid_ffn_single(
+                            target_backend(), chunk_cfg, chunk_desc, storage, cpu_be,
+                            tok_post, tok_sel, tok_wts, n_expert_used, single_out)) {
+                        result.error = "prefill_ffn_single";
+                        step_graph_destroy(prefill_sg);
+                        if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+                        if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
+                        cleanup_graphs();
+                        return result;
+                    }
+                    std::memcpy(ffn_batch_out.data() + (size_t)ti * (size_t)hidden,
+                                single_out.data(), sizeof(float) * (size_t)hidden);
                 }
-                std::memcpy(ffn_batch_out.data() + (size_t)fb * (size_t)hidden,
-                            sub_out.data(),
-                            (size_t)fl * (size_t)hidden * sizeof(float));
             }
 
             // Combine FFN output + residual → embed_all for next layer
@@ -634,10 +794,11 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
             }
             const auto t4 = HybridClock::now();
             ffn_us_total += elapsed_us(t3, t4);
-
-            step_graph_destroy(prefill_sg);
         }
     }
+    step_graph_destroy(prefill_sg);
+    if (ffn_hot_alloc) ggml_gallocr_free(ffn_hot_alloc);
+    if (ffn_cold_alloc) ggml_gallocr_free(ffn_cold_alloc);
 
     // Copy last token's output to act_cur for decode
     std::memcpy(act_cur.data(), embed_all.data() + (size_t)(prompt_len - 1) * (size_t)hidden,
@@ -729,8 +890,9 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                         cleanup_graphs();
                         return result;
                     }
-                    ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                            sizeof(float) * (size_t)hidden);
+                    // Upload embedding async on compute stream
+                    ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur,
+                                                  act_cur.data(), 0, sizeof(float) * (size_t)hidden);
 
                     PipelinedDecodeTelemetry tel;
                     if (!pipelined_decode_one_token(*pipe_state_, target_backend(), target_weights(),
@@ -749,14 +911,31 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                         decode_tel_accum.ffn_us += tel.ffn_us;
                         decode_tel_accum.ffn_allhot_us += tel.ffn_allhot_us;
                         decode_tel_accum.ffn_mixed_us += tel.ffn_mixed_us;
+                        decode_tel_accum.gpu_idle_us += tel.gpu_idle_us;
+                        decode_tel_accum.tensor_io_us += tel.tensor_io_us;
+                        decode_tel_accum.combine_overhead_us += tel.combine_overhead_us;
+                        decode_tel_accum.cold_cpu_us += tel.cold_cpu_us;
+                        decode_tel_accum.cold_compute_us += tel.cold_compute_us;
+                        decode_tel_accum.hot_graph_build_us += tel.hot_graph_build_us;
+                        decode_tel_accum.ffn_post_get_us += tel.ffn_post_get_us;
+                        decode_tel_accum.sync_wait_us += tel.sync_wait_us;
                         decode_tel_accum.allhot_layers += tel.allhot_layers;
                         decode_tel_accum.mixed_layers += tel.mixed_layers;
                         decode_tel_accum.total_layers += tel.total_layers;
+                        decode_tel_accum.hot_graph_rebuilds += tel.hot_graph_rebuilds;
+                        decode_tel_accum.routed_ffn_layers += tel.routed_ffn_layers;
+                        decode_tel_accum.routed_prefn_us += tel.routed_prefn_us;
+                        decode_tel_accum.routed_sync_us += tel.routed_sync_us;
+                        decode_tel_accum.routed_readback_us += tel.routed_readback_us;
+                        decode_tel_accum.routed_cpu_remap_us += tel.routed_cpu_remap_us;
+                        decode_tel_accum.routed_ffn_dispatch_us += tel.routed_ffn_dispatch_us;
+                        decode_tel_accum.routed_final_sync_us += tel.routed_final_sync_us;
+                        decode_tel_accum.routed_cold_expert_hits += tel.routed_cold_expert_hits;
+                        decode_tel_accum.routed_total_expert_slots += tel.routed_total_expert_slots;
                     }
 
-                    ggml_backend_tensor_get(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
-                                            sizeof(float) * (size_t)hidden);
-                    if (!compute_logits()) {
+                    // act_cur stays on GPU — compute_logits reads it via GPU→GPU copy
+                    if (!compute_logits(pipe_state_->gpu_state.act_cur)) {
                         result.error = "decode_logits";
                         cleanup_graphs();
                         return result;
@@ -793,12 +972,51 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
                                 decode_tel_accum.ffn_mixed_us / 1000.0,
                                 decode_tel_accum.allhot_layers,
                                 decode_tel_accum.mixed_layers);
-                    if (n_dec > 0) {
+                    std::printf("  GPU IDLE: tensor_io=%.1fms combine=%.1fms sync_wait=%.1fms\n",
+                                decode_tel_accum.tensor_io_us / 1000.0,
+                                decode_tel_accum.combine_overhead_us / 1000.0,
+                                decode_tel_accum.sync_wait_us / 1000.0);
+                    std::printf("  CPU TIME: cold_total=%.1fms cold_compute=%.1fms hot_graph_build=%.1fms ffn_post_get=%.1fms\n",
+                                decode_tel_accum.cold_cpu_us / 1000.0,
+                                decode_tel_accum.cold_compute_us / 1000.0,
+                                decode_tel_accum.hot_graph_build_us / 1000.0,
+                                decode_tel_accum.ffn_post_get_us / 1000.0);
+                    std::printf("  hot_graph_rebuilds=%d routed_ffn_layers=%d\n",
+                                decode_tel_accum.hot_graph_rebuilds,
+                                decode_tel_accum.routed_ffn_layers);
+                    // Routed path breakdown
+                    if (decode_tel_accum.routed_ffn_layers > 0) {
+                        const int rl = decode_tel_accum.routed_ffn_layers;
+                        std::printf("  ROUTED PATH (%d layer-evals, %d cold / %d slots = %.1f%% cold):\n",
+                                    rl, decode_tel_accum.routed_cold_expert_hits,
+                                    decode_tel_accum.routed_total_expert_slots,
+                                    decode_tel_accum.routed_total_expert_slots > 0
+                                        ? 100.0 * decode_tel_accum.routed_cold_expert_hits / decode_tel_accum.routed_total_expert_slots
+                                        : 0.0);
+                        std::printf("    per-layer: prefn=%.1fus sync=%.1fus readback=%.1fus remap=%.1fus ffn_dispatch=%.1fus\n",
+                                    (double)decode_tel_accum.routed_prefn_us / rl,
+                                    (double)decode_tel_accum.routed_sync_us / rl,
+                                    (double)decode_tel_accum.routed_readback_us / rl,
+                                    (double)decode_tel_accum.routed_cpu_remap_us / rl,
+                                    (double)decode_tel_accum.routed_ffn_dispatch_us / rl);
+                        std::printf("    totals: sync_stall=%.1fms final_sync=%.1fms\n",
+                                    decode_tel_accum.routed_sync_us / 1000.0,
+                                    decode_tel_accum.routed_final_sync_us / 1000.0);
+                    }
+                    if (n_dec > 0 && decode_tel_accum.total_us > 0) {
+                        const double gpu_compute_us = (double)(decode_tel_accum.prefn_compute_us + decode_tel_accum.ffn_us - decode_tel_accum.cold_cpu_us);
+                        const double gpu_util_pct = 100.0 * gpu_compute_us / (double)decode_tel_accum.total_us;
                         std::printf("  per-token avg: prefn_build=%.2fms prefn_compute=%.2fms readback=%.2fms ffn=%.2fms\n",
                                     decode_tel_accum.prefn_graph_build_us / 1000.0 / n_dec,
                                     decode_tel_accum.prefn_compute_us / 1000.0 / n_dec,
                                     decode_tel_accum.routing_readback_us / 1000.0 / n_dec,
                                     decode_tel_accum.ffn_us / 1000.0 / n_dec);
+                        std::printf("  per-token avg: tensor_io=%.2fms combine=%.2fms cold_cpu=%.2fms cold_compute=%.2fms\n",
+                                    decode_tel_accum.tensor_io_us / 1000.0 / n_dec,
+                                    decode_tel_accum.combine_overhead_us / 1000.0 / n_dec,
+                                    decode_tel_accum.cold_cpu_us / 1000.0 / n_dec,
+                                    decode_tel_accum.cold_compute_us / 1000.0 / n_dec);
+                        std::printf("  estimated GPU utilization: %.1f%%\n", gpu_util_pct);
                     }
                     std::fflush(stdout);
                 }
@@ -845,17 +1063,17 @@ GenerateResult Qwen35MoeBackend::generate(const GenerateRequest & req,
     return result;
 }
 
-GenerateResult Qwen35MoeBackend::restore_and_generate(int slot,
+GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
                                                       const GenerateRequest & req,
                                                       const DaemonIO & io) {
     if (!target_weights().moe_hybrid) {
-        auto result = Qwen35Backend::restore_and_generate(slot, req, io);
+        auto result = Qwen35Backend::restore_and_generate_impl(slot, req, io);
         if (result.ok) maybe_post_request_swap();
         return result;
     }
     // Snapshot restore not supported in hybrid split-load mode.
     // Fall back to full generate (ignores snapshot).
-    return generate(req, io);
+    return generate_impl(req, io);
 }
 
 // ── Hybrid spec-decode: draft → verify via hybrid forward → accept ──────────
@@ -871,8 +1089,8 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     // Ensure pipelined state
     if (!ensure_pipe_state(kv_pos)) return false;
 
-    // Upload to GPU-resident act_cur
-    ggml_backend_tensor_set(pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
+    // Upload to GPU-resident act_cur (async — compute stream ordering guarantees correctness)
+    ggml_backend_tensor_set_async(target_backend(), pipe_state_->gpu_state.act_cur, act_cur.data(), 0,
                             sizeof(float) * (size_t)hidden);
 
     // Run pipelined decode (all 40 layers with cached DeltaNet + hot/cold FFN)
@@ -915,8 +1133,13 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     proj_sg.hidden_input = ggml_new_tensor_3d(proj_sg.ctx, GGML_TYPE_F32, hidden, 1, 1);
     ggml_set_input(proj_sg.hidden_input);
     proj_sg.gf = ggml_new_graph_custom(proj_sg.ctx, 1024, false);
-    ggml_tensor * normed = ggml_rms_norm(proj_sg.ctx, proj_sg.hidden_input, target_weights().rms_eps);
-    normed = ggml_mul(proj_sg.ctx, normed, target_weights().out_norm);
+    ggml_tensor * normed = ggml_rms_norm(
+        proj_sg.ctx,
+        rms_norm_input_f32(proj_sg.ctx, proj_sg.hidden_input),
+        target_weights().rms_eps);
+    normed = ggml_mul(
+        proj_sg.ctx, normed,
+        graph_tensor_f32(proj_sg.ctx, target_weights().out_norm));
     proj_sg.logits = ggml_mul_mat(proj_sg.ctx, target_weights().output, normed);
     ggml_set_output(proj_sg.logits);
     ggml_build_forward_expand(proj_sg.gf, proj_sg.logits);
@@ -1157,12 +1380,12 @@ bool Qwen35MoeBackend::do_hybrid_spec_decode(int committed, int n_gen,
 bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
                                                ggml_backend_t backend,
                                                const TargetWeights & w,
-                                               Qwen35MoeExpertPlacement & out,
+                                               MoeHybridPlacement & out,
                                                std::string * err) {
     // Load hotness table or assume uniform hotness
-    Qwen35MoeRoutingStats hotness;
+    MoeHybridRoutingStats hotness;
     if (hotness_path && hotness_path[0]) {
-        if (!Qwen35MoeRoutingStats::load_csv(std::string(hotness_path), hotness, err)) {
+        if (!MoeHybridRoutingStats::load_csv(std::string(hotness_path), hotness, err)) {
             return false;
         }
         if (hotness.n_layer != w.n_layer || hotness.n_expert != w.n_expert) {
@@ -1277,7 +1500,7 @@ bool Qwen35MoeBackend::load_dynamic_placement(const char * hotness_path,
     }
 
     // Build placement using greedy knapsack with byte budget
-    if (!Qwen35MoeExpertPlacement::build_from_stats_with_layer_bytes(
+    if (!MoeHybridPlacement::build_from_stats_with_layer_bytes(
             hotness, layer_expert_bytes, expert_budget,
             /*min_hot_per_layer=*/std::min(w.n_expert_used, w.n_expert),
             out, err)) {

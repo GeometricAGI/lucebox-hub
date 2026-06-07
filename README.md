@@ -201,6 +201,7 @@ DFLASH27B_KV_TQ3=1 \
 | `--prefill-compression {off,auto,always}` | `off` | When to score+compress the prompt |
 | `--prefill-threshold N` | `32000` | Token threshold for `auto` |
 | `--prefill-keep-ratio F` | `0.05` | Fraction of source tokens kept (0.02 @128K, 0.10 @32K) |
+| `--prefill-curve T:R [T:R ...]` | off (flat keep-ratio) | Piecewise keep-ratio curve, linear-interpolated over `(tokens, ratio)` breakpoints, e.g. `10000:0.5 40000:0.2 100000:0.1` (2× compression @10K, 5× @40K, 10× @100K+). Overrides `--prefill-keep-ratio`; per-session bandit override still wins. |
 | `--prefill-drafter <gguf>` | required if on | Drafter weights (Qwen3-0.6B BF16 GGUF) |
 | `--prefill-skip-park` | off | Keep drafter resident across requests (more VRAM, faster) |
 | `DFLASH_FP_USE_BSA=1` | `0` | Dispatch sparse FA through BSA (sm_80+); required for headline 10.4× |
