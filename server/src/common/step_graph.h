@@ -69,6 +69,8 @@ inline void step_graph_free(StepGraph & sg) {
     sg.ffn_residual = nullptr;
     sg.ffn_post = nullptr;
     sg.moe_weights = nullptr;
+    sg.hot_local_lut = nullptr;
+    sg.valid_lut = nullptr;
     sg.delta_captures.clear();
     sg.moe_selected.clear();
 }
