@@ -251,11 +251,14 @@ context or a larger target).
 `--spark` turns the split into a self-tuning command: it enables the bounded
 GPU expert cache, sizes it from the VRAM target, loads a placement profile
 next to the model (`<model>.gguf.spark.csv`) if present, and keeps refining it
-from live traffic across restarts. Cap total VRAM with `--spark-vram <GiB>`.
+from live traffic across restarts. Cap total VRAM with `--spark-vram <GiB>`, or
+pin the cache ring directly with `--spark-slots <N>` (default: auto-sized from
+the VRAM target).
 
 ```bash
-dflash_server models/laguna-xs2-Q4_K_M.gguf --spark                # size to the card
-dflash_server models/laguna-xs2-Q4_K_M.gguf --spark --spark-vram 14
+dflash_server models/laguna-xs2-Q4_K_M.gguf --spark                  # size to the card
+dflash_server models/laguna-xs2-Q4_K_M.gguf --spark --spark-vram 14  # cap total VRAM
+dflash_server models/laguna-xs2-Q4_K_M.gguf --spark --spark-slots 48 # pin 48 cache slots/layer
 ```
 
 Under offload, laguna decodes the whole token in **one fused graph**
@@ -293,7 +296,7 @@ Substitute `<ARCH>` = `LAGUNA` or `QWEN35MOE`. `--spark` sets these for you.
 | `DFLASH_SPARK 1` | Enable the autotuning Spark path (set by `--spark`). |
 | `DFLASH_SPARK_VRAM_MB N` | Total VRAM target Spark sizes the hot tier + cache to (set by `--spark-vram`). |
 | `DFLASH_<ARCH>_EXPERT_CACHE 1` | Bounded GPU expert cache: swap selected cold experts into spare slots (LRU) so they are served on-GPU; cold-miss falls toward 0 after warmup. |
-| `DFLASH_<ARCH>_CACHE_SLOTS N` | Cache slots per layer (default: auto-sized from the VRAM target). |
+| `DFLASH_<ARCH>_CACHE_SLOTS N` | Cache slots per layer (default: auto-sized from the VRAM target; `--spark-slots N` is the CLI equivalent). |
 | `DFLASH_LAGUNA_GPU_REMAP 1` | Serve the cache through the unified on-GPU FFN (required for the laguna cache to take effect). |
 | `DFLASH_LAGUNA_NO_SINGLE_GRAPH 1` | Fall back to per-layer decode instead of the default single-graph hybrid. |
 
