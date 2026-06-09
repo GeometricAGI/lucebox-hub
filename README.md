@@ -151,6 +151,35 @@ python3 harness/client_test_runner.py bench \
   --n-sample 3
 ```
 
+## Quick Start With Docker
+
+Prebuilt images on GHCR track `main`. No CUDA toolkit, no build step:
+pull, mount your weights, serve. OpenAI-compatible API on `:8000`.
+
+<table>
+<tr>
+<td width="50%" valign="middle">
+
+```bash
+# NVIDIA (CUDA 12+)
+docker run --rm --gpus all -p 8000:8080 \
+  -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+  ghcr.io/luce-org/lucebox-hub:cuda12
+```
+
+Drop a GGUF target into `server/models/` first, then hit
+`:8000/v1/chat/completions`. Full walkthrough in the
+[Docker blog](https://lucebox.com/blog/docker).
+
+</td>
+<td width="50%" valign="middle">
+
+<a href="https://lucebox.com/blog/docker"><img src="assets/docker.png" alt="Lucebox prebuilt Docker images" width="100%" /></a>
+
+</td>
+</tr>
+</table>
+
 ## Run the Server
 
 Default: Qwen 3.6-27B Q4_K_M target + Lucebox Q4_K_M DFlash drafter on RTX 3090. DDTree budget=22, TQ3_0 KV cache, sliding FA window 2048. OpenAI-compatible HTTP on `:8000`.

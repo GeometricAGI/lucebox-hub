@@ -79,3 +79,17 @@ fix-plan.md
 # Harness test artifacts
 .harness-work/
 health
+
+# lucebox host-side generated config + benchmark output
+.lucebox/
+models/.lucebox/
+
+# Claude Code session state (worktrees, agent scratchpads)
+.claude/
+
+# Local tuning snapshots (not committed)
+dflash/docs/tuning-snapshots/
+
+# Workdir editor backup suffixes
+*.git-head
+*.pre-pflash-rename

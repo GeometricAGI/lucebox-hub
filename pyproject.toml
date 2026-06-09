@@ -14,7 +14,26 @@ dependencies = [
 
 [project.optional-dependencies]
 megakernel = ["qwen35-megakernel-bf16"]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "mypy>=1.10,<2", "ruff>=0.14,<1"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+# Staged lint adoption for the Python surfaces touched by the Docker,
+# benchmark, autotune, and host-CLI stack. Untouched server-adjacent scripts and
+# vendored dependencies stay outside this gate until they are cleaned up.
+#
+# No Python package at the repo root to lint yet; workspace members add
+# their own include lists. The pyproject-driven ruff config still applies.
+include = []
+extend-exclude = [
+    "dflash/deps",
+    "megakernel",
+    "pflash",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
 
 [tool.uv]
 package = false
@@ -31,6 +50,8 @@ package = false
 no-build-isolation-package = ["qwen35-megakernel-bf16"]
 
 [tool.uv.workspace]
+# Workspace members. Keeping the list to the packages that live in this
+# repo lets `uv lock --check` / `uv sync --frozen` pass.
 members = ["server", "optimizations/megakernel", "optimizations/pflash"]
 
 [tool.uv.sources]
@@ -43,3 +64,8 @@ torch = { index = "pytorch-cu128" }
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
