@@ -25,6 +25,7 @@ on:
   pull_request:
     paths:
       - Dockerfile
+      - Dockerfile.rocm
       - docker-bake.hcl
       - .dockerignore
       - .github/workflows/docker.yml
@@ -76,7 +77,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [cuda12]
+        variant: [cuda12, rocm]
     steps:
       - name: Free runner disk space
         # The default ubuntu-latest image keeps ~25 GB of preinstalled

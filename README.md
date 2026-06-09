@@ -165,6 +165,13 @@ pull, mount your weights, serve. OpenAI-compatible API on `:8000`.
 docker run --rm --gpus all -p 8000:8080 \
   -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
   ghcr.io/luce-org/lucebox-hub:cuda12
+
+# AMD (ROCm 6+, Strix Halo / RX 7900)
+docker run --rm --device /dev/kfd --device /dev/dri \
+  --group-add video --group-add render \
+  --security-opt seccomp=unconfined -p 8000:8080 \
+  -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+  ghcr.io/luce-org/lucebox-hub:rocm
 ```
 
 Drop a GGUF target into `server/models/` first, then hit
