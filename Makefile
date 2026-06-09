@@ -51,7 +51,7 @@ build:  ## Build lucebox-hub:cuda12 locally via docker buildx bake.
 
 .PHONY: serve
 serve:  ## Run the local image, foreground. Models bind-mounted from $(MODELS_DIR).
-	docker run --rm --gpus all -p 8080:8080 \
+	docker run --rm --gpus all -p 8000:8080 \
 		-v $(MODELS_DIR):/opt/lucebox-hub/server/models:ro \
 		--name lucebox-gemma \
 		$(IMAGE) serve

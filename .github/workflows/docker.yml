@@ -12,12 +12,30 @@ on:
   # event=tag` + `type=semver` rules below.
   release:
     types: [published]
-  # Build + push the rolling `:cuda12` tag on every main merge so the public
-  # image tracks main. The metadata-action `enable=` rule below gates the
-  # moving tag on `github.ref == refs/heads/main`, and the build step's
-  # `push:` condition includes push events on main.
+  # Build + push the rolling `:cuda12` / `:rocm` tags when an image-affecting
+  # file changes on main, so the public images track main without a ~2h
+  # rebuild on every unrelated commit (docs, harness, server tweaks that
+  # don't reach the image). Same paths as the PR guard below. The
+  # metadata-action `enable=` rule gates the moving tag on
+  # `github.ref == refs/heads/main`; the build step's `push:` condition
+  # includes push events on main.
   push:
     branches: [main]
+    paths:
+      - Dockerfile
+      - Dockerfile.rocm
+      - docker-bake.hcl
+      - .dockerignore
+      - .github/workflows/docker.yml
+      - server/CMakeLists.txt
+      - server/src/**
+      - server/test/**
+      - server/include/**
+      - server/scripts/**
+      - server/deps/**
+      - server/pyproject.toml
+      - pyproject.toml
+      - uv.lock
   # Build-only CI guard on PRs that touch the docker surface. We never push
   # from a PR — even if we wanted to, GITHUB_TOKEN on PRs from forks lacks
   # `packages:write`. The point is to catch Dockerfile / bake-file / arch-
@@ -25,6 +43,7 @@ on:
   pull_request:
     paths:
       - Dockerfile
+      - Dockerfile.rocm
       - docker-bake.hcl
       - .dockerignore
       - .github/workflows/docker.yml
@@ -76,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [cuda12]
+        variant: [cuda12, rocm]
     steps:
       - name: Free runner disk space
         # The default ubuntu-latest image keeps ~25 GB of preinstalled

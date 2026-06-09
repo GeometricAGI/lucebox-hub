@@ -44,6 +44,21 @@ variable "TAG"      { default = "" }
 # multiple arches.
 variable "DFLASH_CUDA_ARCHES" { default = "75;80;86;89;90;120" }
 
+# Fat-binary HIP/gfx arch list for the rocm variant (semicolon-separated).
+# Default is gfx1151 (Strix Halo, the lucebox appliance iGPU) only, to keep the
+# build tractable. Widen for a broadly-runnable released image, e.g.:
+#   DFLASH_HIP_ARCHES="gfx1151;gfx1100;gfx1200;gfx942;gfx90a" docker buildx bake rocm
+# (gfx1151 Strix Halo, gfx1100 RX7900/RDNA3, gfx1200 RDNA4, gfx942 MI300,
+# gfx90a MI200.)
+variable "DFLASH_HIP_ARCHES" { default = "gfx1151" }
+
+# ROCm base-image tag for the rocm variant. gfx1151 needs >= 6.4.1. Default
+# stays 6.4.1 (7.2.x has shown intermittent problems on Strix Halo), but on a
+# ROCm 7.x HOST driver the 6.4.x userspace can segfault at model load — set
+# ROCM_VERSION=7.2.2 there. Keep the base aligned with the host driver (see
+# Dockerfile.rocm).
+variable "ROCM_VERSION" { default = "6.4.1" }
+
 # Image identity stamped into /opt/lucebox-hub/IMAGE_INFO at build time and
 # surfaced under /props.build at runtime (git_sha, image_tag, build_time).
 # CI sets all three from the workflow context; local builds get a best-
@@ -71,6 +86,12 @@ function "image_tags" {
 
 group "default" {
     targets = ["cuda12-local"]
+}
+
+# Build every published variant locally (cuda + rocm). CI builds these as a
+# matrix; this group is the local equivalent for a full two-image build.
+group "all" {
+    targets = ["cuda12-local", "rocm-local"]
 }
 
 # CI integration. docker/metadata-action in .github/workflows/docker.yml
@@ -107,4 +128,30 @@ target "cuda12" {
 target "cuda12-local" {
     inherits = ["_cuda12-base"]
     tags = image_tags("cuda12")
+}
+
+# ── ROCm / HIP ───────────────────────────────────────────────────────────────
+# AMD GPU build from Dockerfile.rocm: gfx1151 (Strix Halo) by default, widen via
+# DFLASH_HIP_ARCHES for a broadly-runnable image. Block-Sparse-Attention is
+# CUDA-only and disabled in this variant (see Dockerfile.rocm).
+target "_rocm-base" {
+    context    = "."
+    dockerfile = "Dockerfile.rocm"
+    args = {
+        ROCM_VERSION      = ROCM_VERSION
+        UBUNTU_VERSION    = "22.04"
+        DFLASH_HIP_ARCHES = DFLASH_HIP_ARCHES
+        GIT_SHA           = GIT_SHA
+        IMAGE_TAG         = IMAGE_TAG
+        BUILD_TIME        = BUILD_TIME
+    }
+}
+
+target "rocm" {
+    inherits = ["_rocm-base", "docker-metadata-action"]
+}
+
+target "rocm-local" {
+    inherits = ["_rocm-base"]
+    tags = image_tags("rocm")
 }

@@ -1,0 +1,215 @@
+# syntax=docker/dockerfile:1.7
+
+# ─── Stage 1: builder ───────────────────────────────────────────────────────
+# ROCm/HIP sibling of the CUDA Dockerfile. ROCM_VERSION / UBUNTU_VERSION /
+# DFLASH_HIP_ARCHES are build args so the same Dockerfile can be repinned.
+#   • lucebox-hub:rocm  — ROCm 6.4.x, gfx1151 (+ optional fat gfx list)
+# See docker-bake.hcl for the canonical invocation.
+#
+# NOTE: gfx1151 (Strix Halo / Ryzen AI MAX) needs ROCm >= 6.4.1. The default
+# stays on 6.4.1 because the 7.2.x stack has shown intermittent problems on
+# Strix Halo. The flip side: against a ROCm 7.x HOST driver the 6.4.x
+# userspace can segfault at model load (seen on gfx1151 + host ROCm 7.2.2:
+# SIGSEGV in backend creation, bogus 1.28 TB VRAM report) — in that case
+# rebuild with ROCM_VERSION=7.2.2 to match the host. Rule of thumb: keep the
+# base's major version aligned with the host driver.
+ARG ROCM_VERSION=6.4.1
+ARG UBUNTU_VERSION=22.04
+FROM rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION} AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Fat-binary HIP arch list, semicolon-separated. Each gfx target adds build
+# time + kernel code the same way CUDA arches do, so narrow this to your host
+# for fast local builds:  DFLASH_HIP_ARCHES=gfx1151 docker buildx bake rocm-local
+# dflash-supported gfx targets (all have the sm_75+ equivalent features dflash
+# assumes; pre-RDNA/CDNA1 parts are excluded):
+#   gfx1151  Strix Halo / Ryzen AI MAX+ 395  (the lucebox appliance iGPU)
+#   gfx1100  RDNA3        RX 7900 XTX / W7900
+#   gfx1200  RDNA4        RX 9070
+#   gfx942   CDNA3        MI300X / MI300A
+#   gfx90a   CDNA2        MI200 / MI250
+ARG DFLASH_HIP_ARCHES="gfx1151"
+
+# ROCm toolchain on PATH (hipcc + amdclang). The rocm/dev-ubuntu base installs
+# ROCm at /opt/rocm; ROCM_PATH lets server/CMakeLists.txt resolve the HIP rpath
+# and rocwmma header roots (server/CMakeLists.txt:33-41).
+ENV ROCM_PATH=/opt/rocm
+ENV PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:${PATH}
+
+# Unlike the CUDA image there is NO driver-stub symlink step: the ROCm base
+# ships the real HIP runtime libs (libamdhip64.so etc.) and the host kernel
+# driver (/dev/kfd, /dev/dri) is wired in at run time via --device.
+# hipblas/rocblas: ggml's HIP backend hard-requires them
+# (deps/llama.cpp/ggml/src/ggml-hip/CMakeLists.txt does find_package(hipblas)
+# for its BLAS matmul path). The rocm/dev-ubuntu base ships the HIP toolchain
+# but NOT the math libs, so they are installed explicitly from the ROCm apt
+# repo the base image already configures.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        curl \
+        git \
+        git-lfs \
+        hipblas-dev \
+        libcurl4-openssl-dev \
+        ninja-build \
+        pkg-config \
+        python3 \
+        rocblas-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# COPY ordering mirrors the CUDA Dockerfile: C++ build inputs first so the
+# (slow) HIP build layer stays cached across Python-only edits.
+COPY server/CMakeLists.txt /src/server/CMakeLists.txt
+COPY server/include /src/server/include
+COPY server/src /src/server/src
+COPY server/test /src/server/test
+COPY server/hip_compat /src/server/hip_compat
+COPY server/deps /src/server/deps
+# status.html: dflash_server's POST_BUILD copies server/share/status.html into
+# build/share/. Without this COPY the build links then dies on the missing file.
+COPY server/share /src/server/share
+
+# Submodules must be populated on the host before `docker build` (.git/ is
+# .dockerignore'd so they cannot be fetched inside the image).
+RUN test -f /src/server/deps/llama.cpp/ggml/CMakeLists.txt \
+    || (echo "ERROR: server/deps/llama.cpp submodule not initialised. Run on host:" >&2 \
+        && echo "       git submodule update --init --recursive" >&2 \
+        && exit 1)
+
+# Configure + build for HIP. DFLASH27B_GPU_BACKEND=hip selects the ggml-hip
+# backend (server/CMakeLists.txt:70-78); DFLASH27B_HIP_ARCHITECTURES pins the
+# gfx list. Block-Sparse-Attention is a CUDA-only kernel set, so BSA is OFF for
+# HIP; FA_ALL_QUANTS OFF keeps the fattn build tractable (matches the lucebox
+# native HIP build). CMAKE_BUILD_WITH_INSTALL_RPATH bakes the $ORIGIN-relative
+# rpath (incl. ggml-hip + ROCm lib) so the binaries find their .so files after
+# the COPY into the runtime stage.
+RUN cmake -S /src/server -B /src/server/build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DDFLASH27B_GPU_BACKEND=hip \
+        -DDFLASH27B_HIP_ARCHITECTURES="${DFLASH_HIP_ARCHES}" \
+        -DDFLASH27B_FA_ALL_QUANTS=OFF \
+        -DDFLASH27B_ENABLE_BSA=OFF \
+    && cmake --build /src/server/build --target test_dflash dflash_server test_server_unit --parallel
+
+# Prune the build tree to only what the runtime stage needs: the native server,
+# test_dflash, test_server_unit, and the ggml shared libs their embedded rpath
+# ($ORIGIN/deps/...) looks up.
+RUN cd /src/server/build \
+    && find . -mindepth 1 -maxdepth 1 \
+            ! -name test_dflash ! -name dflash_server ! -name test_server_unit ! -name deps -exec rm -rf {} + \
+    && find deps -mindepth 1 -type f ! -name 'lib*.so*' -delete \
+    && find deps -depth -type d -empty -delete
+
+# Python sources, workspace manifests, lockfile, READMEs (same as CUDA stage).
+COPY pyproject.toml uv.lock README.md /src/
+COPY server/pyproject.toml server/README.md /src/server/
+COPY server/scripts /src/server/scripts
+COPY optimizations/pflash /src/optimizations/pflash
+COPY optimizations/megakernel /src/optimizations/megakernel
+
+# ─── Stage 2: runtime ───────────────────────────────────────────────────────
+# Runtime reuses the ROCm base so the HIP runtime libs (libamdhip64,
+# libhsa-runtime64, librocm-core, …) the binaries link against are present and
+# version-matched to the builder. This makes a larger image than a minimal
+# runtime would; slimming to `ubuntu:${UBUNTU_VERSION}` + the AMD repo's
+# `rocm-language-runtime` meta-package is a follow-up optimisation (the build
+# stage is unaffected, so it can be done independently).
+FROM rocm/dev-ubuntu-${UBUNTU_VERSION}:${ROCM_VERSION} AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Image identity baked in for /props.build (git_sha / image_tag / build_time),
+# wired from docker-bake.hcl. Empty in non-bake builds → JSON null at /props.
+ARG GIT_SHA=""
+ARG IMAGE_TAG=""
+ARG BUILD_TIME=""
+
+ENV ROCM_PATH=/opt/rocm
+ENV PATH=/opt/rocm/bin:${PATH}
+
+# hipblas/rocblas runtime libs: the dflash binaries link ggml-hip against
+# them (see builder stage). Their .so files must be present at runtime for
+# the server to load.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        hipblas \
+        libgomp1 \
+        pciutils \
+        rocblas \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv (pinned) manages Python 3.12 + resolves the lucebox-dflash + pflash
+# workspace. Copied from the official image rather than `curl | sh`, so the
+# version is fixed and no remote installer script runs at build time.
+COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /usr/local/bin/
+
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+    UV_TOOL_DIR=/opt/uv/tools
+
+WORKDIR /opt/lucebox-hub
+
+COPY --from=builder /src/pyproject.toml /src/uv.lock /src/README.md /opt/lucebox-hub/
+COPY --from=builder /src/optimizations/pflash /opt/lucebox-hub/optimizations/pflash
+COPY --from=builder /src/optimizations/megakernel/pyproject.toml \
+                   /src/optimizations/megakernel/README.md \
+                   /opt/lucebox-hub/optimizations/megakernel/
+
+COPY --from=builder /src/server/scripts /opt/lucebox-hub/server/scripts
+COPY --from=builder /src/server/pyproject.toml /src/server/README.md \
+                   /opt/lucebox-hub/server/
+COPY --from=builder /src/server/build /opt/lucebox-hub/server/build
+
+COPY share/model_cards /opt/lucebox-hub/share/model_cards
+RUN mkdir -p /opt/lucebox-hub/server/share \
+    && ln -s /opt/lucebox-hub/share/model_cards \
+             /opt/lucebox-hub/server/share/model_cards
+
+RUN test -x /opt/lucebox-hub/server/build/test_dflash \
+    && test -x /opt/lucebox-hub/server/build/dflash_server \
+    && test -x /opt/lucebox-hub/server/build/test_server_unit \
+    && test -f /opt/lucebox-hub/server/share/model_cards/qwen3.6-27b.json \
+    && chmod +x /opt/lucebox-hub/server/scripts/entrypoint.sh
+
+RUN printf '%s\n%s\n%s\n' "$GIT_SHA" "$IMAGE_TAG" "$BUILD_TIME" \
+        > /opt/lucebox-hub/IMAGE_INFO
+
+# Register the ggml lib dirs with ld.so. HIP names its backend lib dir
+# `ggml-hip` (server/CMakeLists.txt:74), where the CUDA image uses `ggml-cuda`.
+RUN printf '%s\n%s\n' \
+        /opt/lucebox-hub/server/build/deps/llama.cpp/ggml/src \
+        /opt/lucebox-hub/server/build/deps/llama.cpp/ggml/src/ggml-hip \
+        > /etc/ld.so.conf.d/lucebox-ggml.conf \
+    && ldconfig
+
+ENV UV_LINK_MODE=hardlink \
+    UV_NO_CACHE=1
+RUN uv sync --no-dev --frozen --no-editable 2>/dev/null \
+    || uv sync --no-dev --frozen --no-editable
+
+RUN chmod -R a+rX /opt/lucebox-hub/.venv /opt/lucebox-hub /opt/uv
+
+# Models live in server/models/ — bind-mount or volume them in.
+# ROCm run example (note: AMD uses --device, not --gpus):
+#   docker run --rm --device /dev/kfd --device /dev/dri \
+#       --group-add video --group-add render \
+#       --security-opt seccomp=unconfined -p 8080:8080 \
+#       -v "$PWD/server/models:/opt/lucebox-hub/server/models" \
+#       ghcr.io/luce-org/lucebox-hub:rocm
+VOLUME ["/opt/lucebox-hub/server/models"]
+
+ENV DFLASH_HOST=0.0.0.0 \
+    DFLASH_PORT=8080 \
+    DFLASH_BIN=/opt/lucebox-hub/server/build/test_dflash \
+    DFLASH_SERVER_BIN=/opt/lucebox-hub/server/build/dflash_server
+
+EXPOSE 8080
+
+ENTRYPOINT ["/opt/lucebox-hub/server/scripts/entrypoint.sh"]

@@ -353,7 +353,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "name": args.name,
         "url": args.url,
         "model": args.model,
-        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "created_at": dt.datetime.now(dt.UTC).isoformat(),
         "prompts": str(Path(args.prompts)),
         "max_tokens": args.max_tokens,
         "temperature": args.temperature,
@@ -428,7 +428,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         summary["mean_speedup"] = None
 
     report = {
-        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "created_at": dt.datetime.now(dt.UTC).isoformat(),
         "baseline_report": str(Path(args.baseline)),
         "candidate_report": str(Path(args.candidate)),
         "summary": summary,
