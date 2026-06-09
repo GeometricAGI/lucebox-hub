@@ -15,6 +15,7 @@
 
 #include "qwen3_drafter.h"
 #include "qwen3_drafter_model.h"
+#include "qwen3/anchor_params.h"
 #include "common/backend_precision.h"
 #include "internal.h"
 
@@ -558,8 +559,13 @@ static std::vector<int32_t> qwen35_score_and_compress(
     }
 
     const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
-    const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
-    const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
+    const auto ap = resolve_anchor_params(n_chunks,
+        env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
+        env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1));
+    const int anchor_radius   = ap.radius;
+    const int max_anchor_hits = ap.max_hits;
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
 
     const int q0 = std::max(0, S - query_tokens);
@@ -750,8 +756,13 @@ std::vector<int32_t> drafter_score_and_compress(
         tail_chunks = std::max(0, budget - head_chunks);
     }
     const int query_tokens = env_int("DFLASH_COMPRESS_QUERY_TOKENS", 96);
-    const int anchor_radius = env_int("DFLASH_COMPRESS_ANCHOR_RADIUS", 2);
-    const int max_anchor_hits = env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", 8);
+    const auto ap = resolve_anchor_params(n_chunks,
+        env_int("PFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("PFLASH_COMPRESS_MAX_ANCHOR_HITS", -1),
+        env_int("DFLASH_COMPRESS_ANCHOR_RADIUS",   -1),
+        env_int("DFLASH_COMPRESS_MAX_ANCHOR_HITS", -1));
+    const int anchor_radius   = ap.radius;
+    const int max_anchor_hits = ap.max_hits;
     std::vector<uint8_t> selected_mask((size_t)n_chunks, 0);
     std::vector<uint8_t> forced((size_t)n_chunks, 0);
     for (int c = 0; c < std::min(n_chunks, head_chunks); ++c) forced[(size_t)c] = 1;
