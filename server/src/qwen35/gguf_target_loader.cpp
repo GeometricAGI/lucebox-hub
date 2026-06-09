@@ -44,6 +44,7 @@
 // tensor's bytes from the mmap'd file.
 
 #include "internal.h"
+#include "common/derived_scalars.h"
 #include "common/layer_split_utils.h"
 
 #include <cinttypes>
@@ -737,6 +738,31 @@ bool load_target_gguf_partial(const std::string & path,
     }
 
     gguf_free(gctx);
+
+    // Structural defense: derive head_dim / n_head / n_head_kv from weight
+    // tensor shapes and assert against GGUF-declared metadata.
+    // Uses the first full-attention layer; deltanet layers don't carry wq/wk.
+    // wq packs Q+gate: ne[1] = n_head * n_embd_head_k * 2.
+    // wk: ne[1] = n_head_kv * n_embd_head_k.  wq: ne[0] = n_embd.
+    {
+        const int fa_il = out.full_attention_interval - 1;
+        const TargetLayer & fa = out.layers[(size_t)fa_il];
+        if (fa.wq && fa.wk) {
+            const int64_t exp_q_dim  = (int64_t)out.n_head    * out.n_embd_head_k * 2;
+            const int64_t exp_kv_dim = (int64_t)out.n_head_kv * out.n_embd_head_k;
+            const int64_t exp_n_embd = (int64_t)out.n_embd;
+            char tag[16];
+            std::snprintf(tag, sizeof(tag), "blk.%d", fa_il);
+            std::string err;
+            if (!dflash::common::verify_derived_scalars(
+                    fa.wq->ne[1], fa.wk->ne[1], fa.wq->ne[0],
+                    exp_q_dim, exp_kv_dim, exp_n_embd,
+                    tag, err)) {
+                set_last_error(err);
+                return false;
+            }
+        }
+    }
 
     if (tok_embd_off == 0 || tok_embd_type == GGML_TYPE_COUNT) {
         set_last_error("token_embd.weight not found or invalid type");

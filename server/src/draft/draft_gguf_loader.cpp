@@ -24,6 +24,7 @@
 //   blk.<i>.ffn_down.weight                 [hidden, intermediate]  Q8_0 / F16
 
 #include "internal.h"
+#include "common/derived_scalars.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -348,6 +349,41 @@ bool load_draft_gguf(const std::string & path,
     }
 
     gguf_free(gctx);
+
+    // Structural defense: derive head_dim / n_head / n_head_kv from weight
+    // tensor shapes and assert against GGUF-declared metadata.
+    // All draft layers have wq/wk (no deltanet mix), so layer 0 suffices.
+    // wq: [n_embd, n_head*head_dim], ne[1]=n_head*head_dim, ne[0]=n_embd.
+    // wk: [n_embd, n_head_kv*head_dim], ne[1]=n_head_kv*head_dim.
+    {
+        const DraftLayer & L0 = out.layers[0];
+        const int64_t exp_q_dim  = (int64_t)out.n_head    * out.head_dim;
+        const int64_t exp_kv_dim = (int64_t)out.n_head_kv * out.head_dim;
+        const int64_t exp_n_embd = (int64_t)out.n_embd;
+        std::string err;
+        if (!dflash::common::verify_derived_scalars(
+                L0.wq->ne[1], L0.wk->ne[1], L0.wq->ne[0],
+                exp_q_dim, exp_kv_dim, exp_n_embd,
+                "blk.0", err)) {
+            set_last_error(err);
+            return false;
+        }
+        // fc: [n_target_layers*n_embd, n_embd] — ne[0] = n_target_layers*n_embd.
+        if (out.n_target_layers > 0) {
+            const int64_t derived_fc_in  = out.fc->ne[0];
+            const int64_t expected_fc_in = (int64_t)out.n_target_layers * out.n_embd;
+            if (derived_fc_in != expected_fc_in) {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "GGUF shape mismatch: dflash.fc.weight->ne[0]=%lld "
+                    "!= n_target_layers*n_embd=%d*%d=%lld",
+                    (long long)derived_fc_in,
+                    out.n_target_layers, out.n_embd, (long long)expected_fc_in);
+                set_last_error(buf);
+                return false;
+            }
+        }
+    }
 
     char summary[192];
     std::snprintf(summary, sizeof(summary),
