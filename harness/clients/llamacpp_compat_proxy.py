@@ -378,7 +378,7 @@ class Handler(BaseHTTPRequestHandler):
     max_tokens_cap = 0
 
     def log_message(self, fmt, *args):
-        print("[%s] %s" % (self.log_date_time_string(), fmt % args), flush=True)
+        print(f"[{self.log_date_time_string()}] {fmt % args}", flush=True)
 
     def send_json(self, status: int, obj: dict):
         data = json.dumps(obj).encode("utf-8")

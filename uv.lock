@@ -480,11 +480,6 @@ megakernel = [
     { name = "qwen35-megakernel-bf16" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "lucebox-dflash", virtual = "server" },
@@ -495,9 +490,6 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.14,<1" },
 ]
 provides-extras = ["megakernel", "dev"]
-
-[package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.3" }]
 
 [[package]]
 name = "markdown-it-py"

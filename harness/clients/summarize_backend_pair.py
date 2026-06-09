@@ -8,7 +8,6 @@ import re
 import sys
 from pathlib import Path
 
-
 LUCEBOX_DONE_RE = re.compile(r"(?:chat|responses|messages) DONE .*? in=(?P<prompt>\d+) out=(?P<out>\d+)")
 LUCEBOX_DECODE_RE = re.compile(r"decode=[^(]*\((?P<tps>[0-9.]+)tok/s\)")
 LUCEBOX_OVERALL_RE = re.compile(r"\s(?P<tps>[0-9.]+) tok/s\s+finish=")

@@ -154,8 +154,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # uv manages Python 3.12 (required by the workspace) and resolves the
 # lucebox-dflash + pflash members declared in pyproject.toml.
-RUN curl -LsSf https://astral.sh/uv/install.sh \
-        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh
+# uv (pinned) copied from the official image rather than `curl | sh`, so the
+# version is fixed and no remote installer script runs at build time.
+COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /usr/local/bin/
 
 # Install Python to a world-readable location, not /root/.local/share/uv/
 # (the default). The container runs as the host UID for bind-mount sanity

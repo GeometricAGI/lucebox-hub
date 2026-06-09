@@ -22,8 +22,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -31,7 +29,6 @@ import venv
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WORK_DIR = ROOT / ".harness-work"
@@ -982,7 +979,7 @@ def wait_http(base_url: str, proc: subprocess.Popen | None = None, timeout: int 
             status, _body, _elapsed = http_json("GET", base_url + "/health", timeout=2)
             if status == 200:
                 return True
-        except (urllib.error.URLError, TimeoutError, ConnectionResetError, socket.timeout):
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError):
             pass
         time.sleep(1)
     return False
@@ -1552,7 +1549,6 @@ def _score_he_response(text: str, entry_point: str, gold_test: str) -> tuple[boo
     Returns (correct, detail_str).
     """
     import subprocess as _sp
-    import tempfile as _tmp
 
     think_end = text.rfind("</think>")
     answer_text = text[think_end + len("</think>"):] if think_end >= 0 else text
@@ -1883,7 +1879,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
         if status != 200:
             print(f"[bench] WARNING: server health check returned {status}", flush=True)
     except Exception as exc:
-        raise SystemExit(f"[bench] cannot reach server at {base_url}/health: {exc}")
+        raise SystemExit(f"[bench] cannot reach server at {base_url}/health: {exc}") from exc
 
     print(f"[bench] url={base_url}  model={model}  suites={','.join(selected)}", flush=True)
 
@@ -1903,7 +1899,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
     }
 
     # Final summary
-    print(f"\n[bench] === SUMMARY ===", flush=True)
+    print("\n[bench] === SUMMARY ===", flush=True)
     print(f"{'Suite':>8s}  {'OK':>5s}  {'Wall':>7s}  {'TTFT':>7s}  {'Pf tok/s':>9s}  "
           f"{'Out tok/s':>10s}  {'Out tok':>8s}  {'Score':>10s}", flush=True)
     for suite, s in all_suites.items():

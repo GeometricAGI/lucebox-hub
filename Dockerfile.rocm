@@ -142,9 +142,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         rocblas \
     && rm -rf /var/lib/apt/lists/*
 
-# uv manages Python 3.12 + resolves the lucebox-dflash + pflash workspace.
-RUN curl -LsSf https://astral.sh/uv/install.sh \
-        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 INSTALLER_NO_MODIFY_PATH=1 sh
+# uv (pinned) manages Python 3.12 + resolves the lucebox-dflash + pflash
+# workspace. Copied from the official image rather than `curl | sh`, so the
+# version is fixed and no remote installer script runs at build time.
+COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /uvx /usr/local/bin/
 
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python \
     UV_TOOL_DIR=/opt/uv/tools

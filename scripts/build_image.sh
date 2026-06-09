@@ -4,6 +4,8 @@
 #
 # Tagging:
 #   * Untagged tree    → lucebox-hub:cuda12 (moving)
+#                      → lucebox-hub:<short-sha>-cuda12   (pinned, from
+#                        `git describe --always`)
 #   * Tagged `lucebox-v0.3.0` (clean checkout):
 #                      → lucebox-hub:cuda12
 #                      → lucebox-hub:0.3.0-cuda12

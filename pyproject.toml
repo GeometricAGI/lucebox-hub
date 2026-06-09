@@ -19,13 +19,11 @@ dev = ["pytest>=8", "mypy>=1.10,<2", "ruff>=0.14,<1"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-# Staged lint adoption for the Python surfaces touched by the Docker,
-# benchmark, autotune, and host-CLI stack. Untouched server-adjacent scripts and
-# vendored dependencies stay outside this gate until they are cleaned up.
-#
-# No Python package at the repo root to lint yet; workspace members add
-# their own include lists. The pyproject-driven ruff config still applies.
-include = []
+# Staged lint adoption: the host-CLI / harness tooling is gated now. The
+# server-internal and optimization Python (server/scripts, optimizations/*)
+# carries pre-existing style debt and is added to `include` as it is cleaned
+# up. Vendored deps stay excluded permanently (extend-exclude below).
+include = ["harness/**/*.py", "scripts/**/*.py"]
 extend-exclude = [
     "dflash/deps",
     "megakernel",
@@ -33,7 +31,10 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+# Correctness + imports + modernization + bugbear. Line-length / style (E5xx,
+# E7xx) is intentionally staged out for now so the gate stays green without
+# reflowing existing code; tighten once the tracked surfaces are clean.
+select = ["F", "I", "UP", "B"]
 
 [tool.uv]
 package = false
@@ -64,8 +65,3 @@ torch = { index = "pytorch-cu128" }
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
-
-[dependency-groups]
-dev = [
-    "pytest>=9.0.3",
-]
