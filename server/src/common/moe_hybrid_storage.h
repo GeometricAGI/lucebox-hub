@@ -221,6 +221,7 @@ bool build_moe_hybrid_storage_from_file_with_mmap(
     const void * mmap_base,
     size_t mmap_total_size,
     MoeHybridStorage & out,
-    std::string * err = nullptr);
+    std::string * err = nullptr,
+    int cache_slots = 0);
 
 }  // namespace dflash::common

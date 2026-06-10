@@ -1742,11 +1742,15 @@ bool LagunaBackend::build_hybrid_storage_from_file(
     int cache_slots = 0;
     if (const char * cs = std::getenv("DFLASH_LAGUNA_CACHE_SLOTS")) cache_slots = std::max(0, std::atoi(cs));
     else if (cache_slots_ >= 0) cache_slots = cache_slots_;
-    bool ok = build_moe_hybrid_storage_from_file(hybrid_cfg, backend_, placement,
-                                                 layer_descs, layer_file_data, *hybrid, &err, cache_slots);
-    ::munmap(mmap_addr, file_size);
+    bool ok = build_moe_hybrid_storage_from_file_with_mmap(hybrid_cfg, backend_, placement,
+                                                            layer_descs, layer_file_data,
+                                                            mmap_addr, file_size, *hybrid, &err, cache_slots);
     gguf_free(gctx);
-    if (!ok) return false;
+    if (!ok) {
+        ::munmap(mmap_addr, file_size);
+        return false;
+    }
+    // mmap ownership transferred to the storage (munmapped in ~MoeHybridStorage)
     out_storage = std::move(hybrid);
     return true;
 }
