@@ -51,10 +51,14 @@ struct CachedPrefnGraph {
             inp_embed = o.inp_embed; ffn_post = o.ffn_post;
             ffn_residual = o.ffn_residual;
             moe_selected = o.moe_selected; moe_weights = o.moe_weights;
+            positions = o.positions; kv_write_rows = o.kv_write_rows;
+            kv_win = o.kv_win;
             o.ctx = nullptr; o.gf = nullptr; o.alloc = nullptr;
             o.inp_embed = nullptr; o.ffn_post = nullptr;
             o.ffn_residual = nullptr;
             o.moe_selected = nullptr; o.moe_weights = nullptr;
+            o.positions = nullptr; o.kv_write_rows = nullptr;
+            o.kv_win = 0;
         }
         return *this;
     }
