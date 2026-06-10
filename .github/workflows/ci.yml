@@ -123,7 +123,11 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    needs: [uv-workspace, build]
+    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
+    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
+    # real hardware, so serializing it behind the cloud build only delayed
+    # the strongest signal this CI produces.
+    needs: [uv-workspace]
     runs-on: [self-hosted, gpu, sm86]
     timeout-minutes: 30
     # The box has a single physical GPU: serialize GPU jobs across PRs instead
@@ -191,7 +195,11 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    needs: [uv-workspace, build]
+    # Gate only on the 1-minute workspace check, NOT the ~18-minute hosted
+    # CPU build: the GPU job compiles the same tree itself in ~2 minutes on
+    # real hardware, so serializing it behind the cloud build only delayed
+    # the strongest signal this CI produces.
+    needs: [uv-workspace]
     runs-on: [self-hosted, rocm, gfx1151]
     timeout-minutes: 20
     # Same single box as gpu-tests: serialize GPU jobs across PRs.
