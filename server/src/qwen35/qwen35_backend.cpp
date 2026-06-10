@@ -354,6 +354,11 @@ bool Qwen35Backend::snapshot_used(int slot) const {
     return prefix_snapshots_[slot].ctx != nullptr;
 }
 
+bool Qwen35Backend::restore_target_cache_from_snapshot(int slot) {
+    if (slot < 0 || slot >= PREFIX_SLOTS || !prefix_snapshots_[slot].ctx) return false;
+    return restore_target_cache(prefix_snapshots_[slot], cache_);
+}
+
 int Qwen35Backend::snapshot_cur_pos(int slot) const {
     if (slot < 0 || slot >= PREFIX_SLOTS) return 0;
     return prefix_snapshots_[slot].cur_pos;

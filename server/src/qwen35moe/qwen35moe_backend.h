@@ -65,7 +65,8 @@ private:
     // Returns the logits argmax token. Advances committed by 1.
     bool hybrid_forward_one_token(int32_t tok, int kv_pos,
                                   std::vector<float> & act_cur,
-                                  int32_t & argmax_out);
+                                  int32_t & argmax_out,
+                                  std::vector<float> * logits_out = nullptr);
 
     // Pipelined decode: uses cached DeltaNet graphs + optimized FFN loop
     bool run_pipelined_decode_path(int committed, int n_gen,

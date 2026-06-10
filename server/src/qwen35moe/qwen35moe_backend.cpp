@@ -896,6 +896,32 @@ GenerateResult Qwen35MoeBackend::generate_impl(const GenerateRequest & req,
     auto t_prefill_end = std::chrono::steady_clock::now();
     result.prefill_s = std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
 
+    if (req.snap_slot >= 0 && req.snap_pos > 0 && req.snap_pos == committed) {
+        if (compute_logits()) {
+            int32_t last_tok = 0;
+            float best = logits_buf[0];
+            for (int j = 1; j < vocab; ++j) {
+                if (logits_buf[(size_t)j] > best) {
+                    best = logits_buf[(size_t)j];
+                    last_tok = j;
+                }
+            }
+            target_cache().last_tok = last_tok;
+            if (snapshot_save(req.snap_slot)) {
+                std::printf("[snap] hybrid boundary slot=%d cur_pos=%d\n",
+                            req.snap_slot, committed);
+                std::fflush(stdout);
+            }
+        } else {
+            std::fprintf(stderr, "[snap] hybrid boundary logits failed at cur_pos=%d\n",
+                         committed);
+        }
+    } else if (req.snap_slot >= 0 && req.snap_pos > 0) {
+        std::fprintf(stderr,
+                     "[snap] hybrid skip unsafe boundary slot=%d req_snap_pos=%d cur_pos=%d\n",
+                     req.snap_slot, req.snap_pos, committed);
+    }
+
     // ── Hybrid Decode ──
     if (req.n_gen > 0) {
         auto t_decode_start = std::chrono::steady_clock::now();
@@ -1158,16 +1184,93 @@ GenerateResult Qwen35MoeBackend::restore_and_generate_impl(int slot,
         if (result.ok) maybe_post_request_swap();
         return result;
     }
-    // Snapshot restore not supported in hybrid split-load mode.
-    // Fall back to full generate (ignores snapshot).
-    return generate_impl(req, io);
+    GenerateResult result;
+    DaemonIO out_io = io.with_token_callback(req.on_token);
+    if (slot < 0 || !snapshot_used(slot)) {
+        result.error = "bad slot";
+        out_io.emit(-1);
+        return result;
+    }
+
+    sampler_config() = req.sampler;
+    if (req.do_sample && sampler_config().seed != 0) {
+        sampler_rng_engine().seed(sampler_config().seed);
+    }
+
+    if (req.n_gen > 0 && sampler_config().temp > 0) {
+        std::fprintf(stderr,
+                     "[qwen35moe] hybrid snapshot restore falls back to full generate for temp sampling\n");
+        return generate_impl(req, io);
+    }
+
+    pipe_state_.reset();
+    for (auto & layer : target_weights().moe_hybrid->layers) {
+        layer.hot_graph.free();
+        layer.cold_graph.free();
+    }
+
+    if (!restore_target_cache_from_snapshot(slot)) {
+        result.error = "restore";
+        out_io.emit(-1);
+        return result;
+    }
+
+    const int snap_pos = snapshot_cur_pos(slot);
+    int committed = snap_pos;
+    target_cache().cur_pos = committed;
+
+    const int prompt_len = (int)req.prompt.size();
+    if (prompt_len > 0 && prompt_len < snap_pos) {
+        result.error = "snapshot_longer_than_prompt";
+        out_io.emit(-1);
+        return result;
+    }
+
+    const int hidden = target_weights().n_embd;
+    std::vector<float> act_cur((size_t)hidden);
+    if (prompt_len > snap_pos) {
+        auto t_prefill_start = std::chrono::steady_clock::now();
+        for (int i = snap_pos; i < prompt_len; ++i) {
+            int32_t argmax = -1;
+            if (!hybrid_forward_one_token(req.prompt[(size_t)i], committed,
+                                          act_cur, argmax)) {
+                result.error = "prefill_delta";
+                return result;
+            }
+            committed++;
+            target_cache().cur_pos = committed;
+            target_cache().last_tok = argmax;
+        }
+        result.prefill_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_prefill_start).count();
+    }
+
+    if (req.n_gen > 0) {
+        if (target_cache().last_tok < 0) {
+            std::fprintf(stderr,
+                         "[qwen35moe] hybrid snapshot has no last token; falling back to full generate\n");
+            return generate_impl(req, io);
+        }
+        auto t_decode_start = std::chrono::steady_clock::now();
+        if (!run_pipelined_decode_path(committed, req.n_gen, result.tokens, out_io)) {
+            result.error = "decode";
+            return result;
+        }
+        result.decode_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_decode_start).count();
+    }
+
+    result.ok = true;
+    if (result.ok) maybe_post_request_swap();
+    return result;
 }
 
 // ── Hybrid spec-decode: draft → verify via hybrid forward → accept ──────────
 
 bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
                                                  std::vector<float> & act_cur,
-                                                 int32_t & argmax_out) {
+                                                 int32_t & argmax_out,
+                                                 std::vector<float> * logits_out) {
     const int hidden = target_weights().n_embd;
 
     // Embed the token
@@ -1244,6 +1347,9 @@ bool Qwen35MoeBackend::hybrid_forward_one_token(int32_t tok, int kv_pos,
     std::vector<float> logits_buf((size_t)vocab);
     ggml_backend_tensor_get(proj_sg.logits, logits_buf.data(), 0, sizeof(float) * (size_t)vocab);
     step_graph_destroy(proj_sg);
+    if (logits_out) {
+        *logits_out = logits_buf;
+    }
 
     // Argmax
     argmax_out = 0;
