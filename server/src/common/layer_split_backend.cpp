@@ -172,9 +172,12 @@ GenerateResult LayerSplitBackend::restore_and_generate_impl(
     }
     const int snap_pos = adapter_->snapshot_cur_pos(slot);
     if ((int)req.prompt.size() < snap_pos) {
-        result.error = "snapshot_longer_than_prompt";
-        io.emit(-1);
-        return result;
+        // Snapshot covers more KV than the new prompt (client edited or
+        // summarized its history). Fall back to a fresh full prefill.
+        std::fprintf(stderr,
+            "[pc] snapshot longer than prompt (snap=%d > prompt=%zu) — "
+            "fresh prefill fallback\n", snap_pos, req.prompt.size());
+        return run_from_state(req, io, /*base_pos=*/0, /*reset_state=*/true);
     }
     GenerateRequest delta_req = req;
     delta_req.prompt = std::vector<int32_t>(

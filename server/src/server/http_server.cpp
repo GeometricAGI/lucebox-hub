@@ -2235,6 +2235,24 @@ void HttpServer::worker_loop() {
             }
         }
 
+        // A slot whose snapshot covers more KV than this prompt cannot be
+        // diff-prefilled (the client edited/summarized its history since the
+        // snapshot was saved). Treat as a cache miss; the backend-side
+        // fallback also guards this, but skipping restore here avoids a
+        // pointless snapshot copy-in.
+        if (using_restore) {
+            const int snap_len = backend_.snapshot_cur_pos(cache_slot);
+            if (snap_len > (int)effective_prompt.size()) {
+                std::fprintf(stderr,
+                    "[pc] slot=%d snapshot pos=%d > prompt=%zu — treating as miss\n",
+                    cache_slot, snap_len, effective_prompt.size());
+                cache_slot = -1;
+                prefix_len = 0;
+                using_restore = false;
+                disk_hit = false;
+            }
+        }
+
         // Cold prefix save: for long prompts with no cache hit, prefill to a
         // turn boundary and save a cold checkpoint before the full generation.
         // This makes subsequent requests to similar (but not identical) prompts
