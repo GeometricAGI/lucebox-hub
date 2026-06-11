@@ -748,9 +748,17 @@ GenerateResult Gemma4Backend::restore_and_generate_impl(int slot,
             return result;
         }
     } else if (prompt_len > 0 && prompt_len < snap_pos) {
-        result.error = "snapshot_longer_than_prompt";
-        out_io.emit(-1);
-        return result;
+        // Snapshot covers more KV than the new prompt (client edited or
+        // summarized its history). Fall back to a fresh full prefill.
+        std::fprintf(stderr,
+            "[pc] snapshot longer than prompt (snap=%d > prompt=%d) — "
+            "fresh prefill fallback\n", snap_pos, prompt_len);
+        cache_.cur_pos = 0;
+        committed = do_prefill(req.prompt, out_io, /*kv_offset=*/0);
+        if (committed < 0) {
+            result.error = "prefill";
+            return result;
+        }
     }
     // else: prompt_len == snap_pos → no delta, committed stays at snap_pos
     result.prefill_s = std::chrono::duration<double>(
