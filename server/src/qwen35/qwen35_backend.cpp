@@ -1,4 +1,5 @@
 #include "qwen35_backend.h"
+#include "placement/skip_park_guard.h"
 #include "qwen35_dflash_target.h"
 #include "graph_builders.h"
 #include "dflash_feature_ring.h"
@@ -534,7 +535,22 @@ bool Qwen35Backend::handle_compress(const std::string & line, const DaemonIO & i
     req.drafter_path = (n >= 3 && drafter_path[0])
         ? drafter_path
         : "/opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf";
-    req.skip_park = skip_park;
+    {
+        size_t total_vram = 0;
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
+            total_vram = prop.totalGlobalMem;
+        const bool allowed = dflash::common::skip_park_allowed(
+            skip_park, total_vram, cfg_.device.max_ctx);
+        if (skip_park && !allowed) {
+            std::fprintf(stderr,
+                "[server] --prefill-skip-park downgraded: <32GB GPU with max_ctx>65536"
+                " (VMM VA-fragmentation guard)\n");
+        }
+        req.skip_park = allowed;
+    }
 
     CompressResult result = compress(req);
     for (int32_t t : result.compressed_ids) io.emit(t);

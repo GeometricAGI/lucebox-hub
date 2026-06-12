@@ -278,6 +278,9 @@ static void print_usage(const char * prog) {
         "                              auto compares recent requests to select a stable\n"
         "                              prefix; auto:N uses the last N requests.\n"
         "                              A plain N caches the first N prompt tokens.\n"
+        "  --disk-prefix-cache-compress Enable FlowKV aged-history compression composed\n"
+        "                              with the disk cache. Requires --pflash-drafter.\n"
+        "                              compress=false default is byte-identical to base.\n"
         "\n"
         "Chat template (optional, e.g. froggeric Qwen3.6 template for tool-using\n"
         "agents that need the Anthropic tool_use envelope):\n"
@@ -546,6 +549,8 @@ int main(int argc, char ** argv) {
                 return 2;
             }
             sconfig.disk_cache_policy = policy;
+        } else if (std::strcmp(argv[i], "--disk-prefix-cache-compress") == 0) {
+            sconfig.disk_cache_policy.compress = true;
         } else if (std::strcmp(argv[i], "--cache-type-k") == 0 && i + 1 < argc) {
             cache_type_k = argv[++i];
         } else if (std::strcmp(argv[i], "--cache-type-v") == 0 && i + 1 < argc) {
