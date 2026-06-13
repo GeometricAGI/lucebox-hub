@@ -209,7 +209,9 @@ static void print_usage(const char * prog) {
         "  --target-layer-split <weights>  Reserved layer-split weights\n"
         "  --peer-access        Enable peer access for multi-GPU placement\n"
         "  --chunk <N>          Chunked-prefill chunk size (default: 512)\n"
-        "  --fa-window <N>     Flash-attention sliding window (default: 0=full)\n"
+        "  --fa-window <N>     Flash-attention sliding window (default: 0=full).\n"
+        "                       WARNING: >0 drops system prompt / tool definitions\n"
+        "                       from attention at long contexts. Use 0 for tools.\n"
         "  --model-name <name>  Model name for /v1/models (default: dflash)\n"
         "  --prefix-cache-slots <N>  Prefix cache slots (default: 32, 0 disables)\n"
         "  --ddtree             Enable DDTree speculative decode\n"
@@ -979,6 +981,11 @@ int main(int argc, char ** argv) {
                  bargs.device.peer_access ? "ON" : "off");
     std::fprintf(stderr, "[server] │  chunk           = %d\n", bargs.chunk);
     std::fprintf(stderr, "[server] │  fa_window       = %d\n", bargs.fa_window);
+    if (bargs.fa_window > 0) {
+        std::fprintf(stderr, "[server] │  ⚠  fa_window > 0 drops system prompt / "
+                             "tool definitions from attention at long contexts.\n"
+                             "[server] │     Use --fa-window 0 for tool-call workloads.\n");
+    }
     std::fprintf(stderr, "[server] │  ddtree          = %s\n", bargs.ddtree_mode ? "ON" : "off");
     std::fprintf(stderr, "[server] │  ddtree_budget   = %d\n", bargs.ddtree_budget);
     std::fprintf(stderr, "[server] │  prefix_cache    = %d slots\n", sconfig.prefix_cache_cap);
