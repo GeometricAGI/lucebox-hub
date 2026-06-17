@@ -53,8 +53,8 @@ def _gsm_gold(x):
 
 
 BENCHES = [
-    ("HumanEval", "openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
-    ("GSM8K", "gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", _gsm_gold, 1024),
+    ("HumanEval", "openai/openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
+    ("GSM8K", "openai/gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", _gsm_gold, 1024),
     ("Math500", "HuggingFaceH4/MATH-500", None, "test", lambda x: f"Problem: {x['problem']}\nSolution: Put your final answer in \\boxed{{}}.\n", lambda x: x["answer"], 2048),
 ]
 
@@ -131,7 +131,15 @@ def _auto_max_ctx(n_prompt, n_gen: int = N_GEN):
     # unused KV and can cost >20× prefill time (32K prompt + --kv-q4 +
     # max_ctx=131072 → 1035s vs 38s at max_ctx=32768). See scripts/run.py.
     pad = 64  # covers q_len=16 + ddtree verify overhead with margin
-    return ((n_prompt + n_gen + pad + 255) // 256) * 256
+    fit = ((n_prompt + n_gen + pad + 255) // 256) * 256
+    # The draft conditions on the target_feat ring, a fixed 4096-slot ring
+    # (TARGET_FEAT_CAP_DEFAULT in qwen35_target_graph.cpp) that maps position
+    # P -> slot P%4096. The draft reads features back by position, so max_ctx
+    # must equal the ring cap or the KV/ring sizes disagree, features alias,
+    # and acceptance collapses to AL~1 (non-monotonic in max_ctx: breaks at
+    # both <4096 and >4096). Pin to the ring cap while the sequence fits.
+    TARGET_FEAT_CAP = 4096
+    return TARGET_FEAT_CAP if fit <= TARGET_FEAT_CAP else fit
 
 
 def run_df(path: Path, n_prompt, n_gen: int = N_GEN):
