@@ -63,7 +63,10 @@ bool Qwen35DFlashTarget::verify_batch(
         }
     }
 
-    const bool do_capture = fast_rollback_ && capture_ssm_intermediates;
+    // kvflash's set_rows KV-write is mutually exclusive with delta-intermediate
+    // capture (graph_builders gates use_kv_write_rows on !capture_delta_intermediate);
+    // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
+    const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
 
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
@@ -173,6 +176,16 @@ bool Qwen35DFlashTarget::verify_batch(
     }
 
     cache_.cur_pos = base_pos + n_tokens;
+    return true;
+}
+
+bool Qwen35DFlashTarget::read_verify_logits(int n_tokens, std::vector<float> & out) {
+    if (!sg_.logits || n_tokens <= 0) return false;
+    const int64_t vocab = sg_.logits->ne[0];
+    if (n_tokens > (int)sg_.logits->ne[1]) return false;
+    out.resize((size_t)n_tokens * (size_t)vocab);
+    ggml_backend_tensor_get(sg_.logits, out.data(), 0,
+                            sizeof(float) * out.size());
     return true;
 }
 
