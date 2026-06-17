@@ -49,11 +49,12 @@ def _name(row):
 
 # Map a raw CUDA kernel name to a coarse ggml-op family for fusion rollup.
 _FAMILY = [
+    ("convert / cast",   re.compile(r"convert", re.I)),  # bf16<->f32 dequant/cast
     ("mul_mat / GEMM",   re.compile(r"mul_mat|gemm|cutlass|cublas|ampere|wmma|s16816|tn_align", re.I)),
     ("flash_attn",       re.compile(r"flash.?attn|fattn", re.I)),
     ("rms_norm",         re.compile(r"rms.?norm", re.I)),
     ("rope",             re.compile(r"rope", re.I)),
-    ("silu / unary",     re.compile(r"silu|gelu|unary|\bop_unary", re.I)),
+    ("silu / unary",     re.compile(r"silu|gelu|unary_op|op_silu|op_gelu", re.I)),
     ("mul / bin_bcast",  re.compile(r"bin_bcast|\bmul_f|op_mul|\bmul\b", re.I)),
     ("add",              re.compile(r"\badd_|op_add|\badd\b", re.I)),
     ("concat",           re.compile(r"concat", re.I)),
@@ -110,15 +111,20 @@ def main():
     print("=" * 78)
     print(f"  GPU kernel time : {kern_pf:8.3f} ms/fwd   ({len(rows)} distinct kernels, "
           f"{int(sum(i for *_, i in rows)/F)} launches/fwd)")
-    print(f"  memcpy/memset   : {mem_pf:8.3f} ms/fwd")
+    # memcpy/memset run async on copy streams and largely overlap compute, so it
+    # is reported alongside — not subtracted from — the wall/idle budget.
+    print(f"  memcpy/memset   : {mem_pf:8.3f} ms/fwd   (concurrent; overlaps compute)")
     if args.wall_ms > 0:
-        idle = args.wall_ms - kern_pf - mem_pf
-        idle_pct = 100.0 * idle / args.wall_ms if args.wall_ms else 0.0
-        busy_pct = 100.0 * kern_pf / args.wall_ms if args.wall_ms else 0.0
+        # Idle = wall the GPU spent not executing kernels = launch latency + sync
+        # stalls between kernels. Clamp at 0 (kernel total spans warmup+measured,
+        # wall is measured-only, so tiny noise can push the diff slightly negative).
+        idle = max(0.0, args.wall_ms - kern_pf)
+        idle_pct = 100.0 * idle / args.wall_ms
+        busy_pct = min(100.0, 100.0 * kern_pf / args.wall_ms)
         print(f"  wall (harness)  : {args.wall_ms:8.3f} ms/fwd")
-        print(f"  -> GPU busy     : {busy_pct:6.1f} %")
+        print(f"  -> GPU busy     : {busy_pct:6.1f} %  (kernels on the compute stream)")
         print(f"  -> IDLE (gaps)  : {idle:8.3f} ms/fwd  ({idle_pct:5.1f} %)  "
-              f"[launch latency + sync stalls between kernels]")
+              f"[launch latency + sync stalls; ~0 => kernel-bound, not launch-bound]")
 
     print("\n" + "-" * 78)
     print(f"Longest kernels (top {args.top}, per-forward)")
@@ -161,7 +167,7 @@ def main():
         notes.append(f"{lpf['mul_mat / GEMM']:.0f} GEMM launches/fwd — K/V are computed "
                      "as 4 separate mul_mat (Kctx,Kn,Vctx,Vn); batching wk/wv over "
                      "[ctx||noise] or a fused QKV projection cuts launch count.")
-    if args.wall_ms > 0 and (args.wall_ms - kern_pf - mem_pf) / args.wall_ms > 0.30:
+    if args.wall_ms > 0 and (args.wall_ms - kern_pf) / args.wall_ms > 0.30:
         notes.append("Idle >30%% of wall — the forward is launch-bound; enabling CUDA "
                      "graphs (drop GGML_CUDA_DISABLE_GRAPHS=1) or fusing small ops "
                      "will recover most of it.")

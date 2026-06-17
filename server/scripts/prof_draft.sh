@@ -41,13 +41,17 @@ mkdir -p "$OUTDIR"
 
 # ── Resolve draft model ──────────────────────────────────────────────────
 resolve_draft() {
-  [[ -n "$DRAFT" ]] && { echo "$DRAFT"; return; }
-  for c in models/draft35 models/draft models/draft35/model.safetensors; do
-    if [[ -d "$c" ]]; then
-      local f; f=$(find "$c" -maxdepth 2 \( -name '*.safetensors' -o -name 'dflash-draft-*.gguf' \) | head -1)
-      [[ -n "$f" ]] && { echo "$f"; return; }
-    elif [[ -f "$c" ]]; then echo "$c"; return; fi
-  done
+  local d="$DRAFT"
+  if [[ -z "$d" ]]; then
+    for c in models/draft35 models/draft; do [[ -e "$c" ]] && { d="$c"; break; }; done
+  fi
+  [[ -z "$d" ]] && return
+  # The harness loads safetensors weights; resolve a directory to the file.
+  if [[ -d "$d" ]]; then
+    find "$d" -maxdepth 2 -name '*.safetensors' | head -1
+  else
+    echo "$d"
+  fi
 }
 DRAFT_PATH="$(resolve_draft)"
 if [[ -z "${DRAFT_PATH:-}" || ! -e "$DRAFT_PATH" ]]; then
@@ -115,4 +119,7 @@ PY="${DFLASH_PY:-python3}"
 
 echo
 echo "[prof_draft] open the full timeline with:  nsys-ui $REP.nsys-rep"
-echo "[prof_draft] deep single-kernel metrics:   scripts/prof_draft.sh ... then ncu (see README)"
+echo "[prof_draft] deep single-kernel metrics (e.g. the dominant GEMM):"
+echo "    ncu --set full --launch-count 1 --kernel-name-base demangled \\"
+echo "        -k regex:'gemm|cutlass' -o $OUTDIR/draft_ncu \\"
+echo "        $BIN $DRAFT_PATH --ctx-len $CTX --iters 1 --warmup 0"
