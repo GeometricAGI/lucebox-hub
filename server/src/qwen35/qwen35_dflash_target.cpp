@@ -5,6 +5,7 @@
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
+#include "common/draft_topk_cuda.h"
 // gpu_runtime_compat.h maps the raw cudaStream_t / cudaMemcpy* symbols used
 // below (rollback_to / rollback_to_tree) onto their HIP equivalents. Without
 // it the file only compiles on CUDA via a transitive <cuda_runtime.h>; HIP
@@ -656,12 +657,28 @@ bool Qwen35DFlashTarget::project_hidden_to_topk(
     if (st != GGML_STATUS_SUCCESS) return false;
 
     const int vocab = (int)proj_sg_.logits->ne[0];
+    top_log_probs.assign((size_t)n_tokens * K, 0.0f);
+    top_token_ids.assign((size_t)n_tokens * K, 0);
+
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK_CUDA
+    // GPU path: top-K + logsumexp directly on the logits device buffer, skipping
+    // the vocab×n_tokens D2H and the CPU heap extract. Falls back to the CPU path
+    // on any failure. Escape hatch: DFLASH_GPU_DRAFT_TOPK=0.
+    static const bool kGpuDraftTopk = []() {
+        const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+        return v == nullptr || v[0] != '0';
+    }();
+    if (kGpuDraftTopk &&
+        extract_draft_topk_cuda(proj_sg_.logits->data, n_tokens, vocab, K,
+                                top_log_probs.data(), top_token_ids.data(),
+                                temperature)) {
+        return true;
+    }
+#endif
+
     std::vector<float> logits((size_t)vocab * n_tokens);
     ggml_backend_tensor_get(proj_sg_.logits, logits.data(), 0,
                             sizeof(float) * (size_t)vocab * n_tokens);
-
-    top_log_probs.assign((size_t)n_tokens * K, 0.0f);
-    top_token_ids.assign((size_t)n_tokens * K, 0);
     extract_draft_topk(logits.data(), n_tokens, vocab, K,
                        top_log_probs.data(), top_token_ids.data(), temperature);
     return true;

@@ -395,7 +395,11 @@ if(DFLASH27B_GPU_BACKEND STREQUAL "hip")
 elseif(DFLASH27B_GPU_BACKEND STREQUAL "cuda")
     target_sources(dflash_common PRIVATE
         src/flashprefill_select.cpp
-        src/flashprefill.cpp)
+        src/flashprefill.cpp
+        src/common/draft_topk_cuda.cu)
+    # PUBLIC so consumers (e.g. the test_dflash executable) also see the macro
+    # and take the GPU draft top-K path instead of the CPU fallback.
+    target_compile_definitions(dflash_common PUBLIC DFLASH27B_HAVE_DRAFT_TOPK_CUDA=1)
     # Multi-arch: scan all resolved arches and compile every applicable
     # flashprefill kernel variant.  This lets a single binary run on mixed
     # GPUs (e.g. Volta sm_70 + Pascal sm_61) without "no kernel image" errors.

@@ -270,6 +270,7 @@ using dflash::common::free_qwen35_layer_split_shards;
 #include "qwen35_layer_split_dflash_target.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_mmap.h"
+#include "common/draft_topk_cuda.h"
 using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -3268,16 +3269,35 @@ int main(int argc, char ** argv) {
                 }
             } else {
                 // DDTree K>1: need real log-probs for best-first tree scoring.
-                // Transfer full logits for positions 1..q_len-1.
-                if (!draft_hidden_bridge) {
-                    ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
-                                            sizeof(float) * vocab * q_len);
+                bool topk_done = false;
+#ifdef DFLASH27B_HAVE_DRAFT_TOPK_CUDA
+                // GPU path: top-K + logsumexp on the draft logits device buffer
+                // (positions 1..q_len-1), no full-vocab D2H. Escape: DFLASH_GPU_DRAFT_TOPK=0.
+                static const bool kGpuDraftTopk = [](){
+                    const char * v = std::getenv("DFLASH_GPU_DRAFT_TOPK");
+                    return v == nullptr || v[0] != '0';
+                }();
+                if (kGpuDraftTopk && !draft_hidden_bridge) {
+                    topk_done = dflash::common::extract_draft_topk_cuda(
+                        (const float *)draft_sg.logits->data + (size_t)vocab,
+                        L, vocab, ddtree_K,
+                        ddtree_top_log_probs.data(),
+                        ddtree_top_token_ids.data(),
+                        ddtree_temp);
                 }
-                extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
-                                   L, vocab, ddtree_K,
-                                   ddtree_top_log_probs.data(),
-                                   ddtree_top_token_ids.data(),
-                                   ddtree_temp);
+#endif
+                if (!topk_done) {
+                    // Transfer full logits for positions 1..q_len-1, extract on CPU.
+                    if (!draft_hidden_bridge) {
+                        ggml_backend_tensor_get(draft_sg.logits, draft_logits_buf.data(), 0,
+                                                sizeof(float) * vocab * q_len);
+                    }
+                    extract_draft_topk(draft_logits_buf.data() + (size_t)vocab,
+                                       L, vocab, ddtree_K,
+                                       ddtree_top_log_probs.data(),
+                                       ddtree_top_token_ids.data(),
+                                       ddtree_temp);
+                }
             }
         }
         auto T_draft_logits = sync_us();
