@@ -1,0 +1,18 @@
+# .geo-accel.yml — functions for the Geometric engine to optimize.
+# Two megakernel hot paths (decode + prefill) for Qwen3.5-0.8B on Blackwell.
+
+gpu_arch: NVIDIA_RTX_5090 # consumer Blackwell (sm_120)
+dtype: bfloat16 # activation dtype (nvfp4 is the weight encoding, not a dtype)
+
+targets:
+  # nvfp4 (4-bit weight) single-token decode — the latency-critical path
+  - name: megakernel-decode-nvfp4
+    function: optimizations.megakernel.model_nvfp4.Decoder.step
+    kind: codebase
+    model: Qwen/Qwen3.5-0.8B
+
+  # nvfp4 prompt prefill — the prompt-processing path
+  - name: megakernel-prefill-nvfp4
+    function: optimizations.megakernel.model_nvfp4.Decoder.prefill_tokens
+    kind: codebase
+    model: Qwen/Qwen3.5-0.8B
