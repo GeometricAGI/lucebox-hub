@@ -278,13 +278,38 @@ bool Qwen35DFlashTarget::verify_tree(
         return false;
     }
 
-    // Posterior = per-node target argmax. Tree-shaped graphs can return -1 from
-    // the GPU argmax shortcut, so compute argmax on CPU from full logits.
+    // Posterior = per-node target argmax.
+    //
+    // The verify graph already computes a batched per-node GPU argmax
+    // (sg_.argmax_tokens, built by build_target_step_tree). When the caller does
+    // not need the full logits (greedy decode, logits_out == nullptr) we read
+    // those N_actual int32s directly and skip the vocab×N_actual D2H + CPU
+    // argmax entirely — eliminates the verify-logits transfer hotspot.
+    //
+    // Historically the GPU argmax shortcut has returned -1 for tree-shaped
+    // verify graphs on some builds; guard against that by validating every row
+    // and falling back to the CPU path for the step if any index is bad.
+    // Escape hatch: DFLASH_GPU_VERIFY_ARGMAX=0 forces the legacy CPU path.
+    static const bool kGpuVerifyArgmax = []() {
+        const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
+        return v == nullptr || v[0] != '0';
+    }();
     const int vocab = (int)sg_.logits->ne[0];
+    posterior_out.resize(N_actual);
+
+    if (kGpuVerifyArgmax && !logits_out && sg_.argmax_tokens) {
+        ggml_backend_tensor_get(sg_.argmax_tokens, posterior_out.data(), 0,
+                                sizeof(int32_t) * N_actual);
+        bool ok = true;
+        for (int i = 0; i < N_actual; i++) {
+            if (posterior_out[i] < 0 || posterior_out[i] >= vocab) { ok = false; break; }
+        }
+        if (ok) return true;  // fast path; otherwise fall through to CPU argmax
+    }
+
     std::vector<float> logits((size_t)vocab * N_actual);
     ggml_backend_tensor_get(sg_.logits, logits.data(), 0,
                             sizeof(float) * (size_t)vocab * N_actual);
-    posterior_out.resize(N_actual);
     for (int i = 0; i < N_actual; i++) {
         const float * row = logits.data() + (size_t)i * vocab;
         int am = 0; float best = row[0];
