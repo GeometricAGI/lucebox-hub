@@ -18,9 +18,7 @@ constexpr int kBlock   = 256;   // threads per block (power of two for the reduc
 constexpr int kMaxSplit = 128;  // max vocab splits per position (combine-block cap)
 
 // The workload is tiny in rows (n_positions ~ 15) but huge in vocab (~152k),
-// so it is purely DRAM-bandwidth bound: ~9 MB to read per call. The original
-// one-block-per-position layout launched only ~15 blocks, leaving most of the
-// GPU's SMs idle and hitting only a fraction of peak bandwidth. We instead
+// so it is purely DRAM-bandwidth bound: ~9 MB to read per call. We 
 // split each position's vocab scan across `split` blocks (a 2D grid of
 // n_positions × split) so the whole device stays busy, then a cheap second
 // kernel merges the `split` partials per position into the final top-K.
