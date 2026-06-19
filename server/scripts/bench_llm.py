@@ -53,8 +53,8 @@ def _gsm_gold(x):
 
 
 BENCHES = [
-    ("HumanEval", "openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
-    ("GSM8K", "gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", _gsm_gold, 1024),
+    ("HumanEval", "openai/openai_humaneval", None, "test", lambda x: x["prompt"], None, N_GEN),
+    ("GSM8K", "openai/gsm8k", "main", "test", lambda x: f"Question: {x['question']}\nAnswer: ", _gsm_gold, 1024),
     ("Math500", "HuggingFaceH4/MATH-500", None, "test", lambda x: f"Problem: {x['problem']}\nSolution: Put your final answer in \\boxed{{}}.\n", lambda x: x["answer"], 2048),
 ]
 

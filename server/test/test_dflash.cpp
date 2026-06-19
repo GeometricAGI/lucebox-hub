@@ -270,6 +270,10 @@ using dflash::common::free_qwen35_layer_split_shards;
 #include "qwen35_layer_split_dflash_target.h"
 #include "common/dflash_spec_decode.h"
 #include "common/gguf_mmap.h"
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+#include "common/restricted_lm_head_cuda.h"
+#include "common/topm_extract_cuda.h"
+#endif
 using dflash::common::is_eos_tok;
 
 // ─── Layer-split daemon — extracted to src/qwen35/layer_split_daemon.{h,cpp} ─
@@ -3104,6 +3108,29 @@ int main(int argc, char ** argv) {
     std::vector<double>  massp95_sum(calib_Mgrid.size(), 0.0);
     std::vector<int64_t> massp95_bad(calib_Mgrid.size(), 0);
 
+    // Candidate-restricted greedy LM head (DFLASH_TOPK_HEAD=M). On the chain
+    // fast-rollback single-GPU path, replace the verify-side full-vocab head
+    // with: draft top-M extract → fused Q6_K gather/dot over those candidates →
+    // argmax. Approximate-greedy (exact iff target argmax ∈ draft top-M).
+    int    g_topk_head_M = 0;
+    double tt_head_extract = 0, tt_head_kernel = 0;
+    long   head_steps = 0;
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+    if (const char * e = std::getenv("DFLASH_TOPK_HEAD")) g_topk_head_M = std::atoi(e);
+    int32_t * d_cand = nullptr, * d_cand_use = nullptr, * d_head_tok = nullptr;
+    void * d_topm_scr = nullptr, * d_head_keys = nullptr;
+    // Node count upper bound: chain uses q_len positions; tree uses budget+1 nodes.
+    const int topk_head_Nmax = std::max(q_len, ddtree_budget + 1);
+    if (g_topk_head_M > 0) {
+        cudaMalloc(&d_cand,      (size_t)g_topk_head_M * q_len          * sizeof(int32_t));
+        cudaMalloc(&d_cand_use,  (size_t)g_topk_head_M * topk_head_Nmax * sizeof(int32_t));
+        cudaMalloc(&d_head_tok,  (size_t)topk_head_Nmax * sizeof(int32_t));
+        cudaMalloc(&d_head_keys, (size_t)topk_head_Nmax * sizeof(unsigned long long));
+        cudaMalloc(&d_topm_scr,  dflash::common::extract_topm_scratch_bytes(q_len));
+        std::printf("[topk-head] restricted greedy head ON, M=%d\n", g_topk_head_M);
+    }
+#endif
+
     while (n_generated < n_gen) {
         const int need_commit_budget = n_gen - n_generated;
 
@@ -3378,9 +3405,16 @@ int main(int argc, char ** argv) {
             const int N_actual = 1 + tree.n_nodes;  // actual tree size
             const int N = ddtree_budget + 1;         // fixed allocation size for gallocr reuse
 
+            // Candidate-restricted greedy head on the tree path: single-GPU,
+            // greedy only (temp>0 samples the bonus from full logits, which we
+            // skip). Per node, candidates come from the draft top-M at the
+            // node's depth (same alignment as the chain path).
+            const bool tree_rhead = (g_topk_head_M > 0) && !draft_hidden_bridge
+                                  && (g_sampler.temp == 0.0f);
             if (!build_target_step_tree(sg, w, cache, backend,
                                         /*kv_start=*/committed, /*n_tokens=*/N,
-                                        g_fa_window, g_kq_stride_pad)) {
+                                        g_fa_window, g_kq_stride_pad,
+                                        /*restricted_head=*/tree_rhead)) {
                 std::fprintf(stderr, "ddtree verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -3463,10 +3497,39 @@ int main(int argc, char ** argv) {
             // after the root even though logits are valid. This is test-only;
             // server decode paths are unaffected.
             std::vector<int32_t> posterior(N_actual);
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+            if (tree_rhead) {
+                // Per node: extract draft top-M, map node i (depth d) to draft
+                // row min(d+1, q_len-1), fused Q6_K gather/dot/argmax → posterior.
+                auto Th0 = sync_us();
+                const int dvocab = (int)draft_sg.logits->ne[0];
+                dflash::common::extract_topm_cuda(
+                    (const float *)draft_sg.logits->data, dvocab, q_len, g_topk_head_M,
+                    d_cand, d_topm_scr, 0);
+                for (int i = 0; i < N_actual; i++) {
+                    const int depth = (i == 0) ? 0 : (int)tree.depths[i - 1];
+                    const int src = std::min(depth + 1, q_len - 1);
+                    cudaMemcpyAsync(d_cand_use + (size_t)i * g_topk_head_M,
+                                    d_cand + (size_t)src * g_topk_head_M,
+                                    (size_t)g_topk_head_M * sizeof(int32_t),
+                                    cudaMemcpyDeviceToDevice, 0);
+                }
+                dflash::common::restricted_lm_head_q6k(
+                    w.output->data, (int)w.output->ne[0], (int)w.output->ne[1],
+                    (const float *)sg.hidden_states->data, N_actual,
+                    d_cand_use, g_topk_head_M, d_head_tok, d_head_keys, 0);
+                cudaMemcpy(posterior.data(), d_head_tok, sizeof(int32_t) * N_actual,
+                           cudaMemcpyDeviceToHost);
+                tt_head_kernel += std::chrono::duration<double, std::micro>(sync_us() - Th0).count();
+                head_steps++;
+            } else
+#endif
+            {
             ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
                                     sizeof(float) * (size_t)vocab * N_actual);
             for (int i = 0; i < N_actual; i++) {
                 posterior[i] = argmax_f32(verify_logits_buf.data() + (size_t)i * vocab, vocab);
+            }
             }
             auto T_verify_logits_ddtree = sync_us();
             tt_verify_logits += std::chrono::duration<double, std::micro>(
@@ -3731,13 +3794,21 @@ int main(int argc, char ** argv) {
 
         if (!seq_verify) {
             const int verify_fa_window = g_fa_window;
+            // Restricted greedy head only on the single-GPU fast-rollback chain
+            // path (where draft logits use the target head over the shared vocab,
+            // and the commit path never reads sg.logits).
+            const bool rhead = (g_topk_head_M > 0) && !draft_hidden_bridge && fast_rollback;
             if (!build_target_step(sg, w, cache, backend,
                                     /*kv_start=*/committed, /*n_tokens=*/q_len,
                                     /*with_mask=*/true, /*capture=*/true,
                                     /*capture_delta_intermediate=*/fast_rollback,
                                     verify_fa_window,
                                     /*last_token_logits_only=*/false,
-                                    g_kq_stride_pad)) {
+                                    g_kq_stride_pad,
+                                    /*capture_moe_router=*/false,
+                                    /*kvflash_mask=*/false,
+                                    /*capture_qk=*/false,
+                                    /*restricted_head=*/rhead)) {
                 std::fprintf(stderr, "verify build failed\n"); return 1;
             }
             T_verify_build = sync_us();
@@ -3783,6 +3854,37 @@ int main(int argc, char ** argv) {
             T_verify_compute = sync_us();
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
+#ifdef DFLASH27B_HAVE_TOPK_HEAD
+            if (rhead) {
+                // Candidate-restricted greedy head. Extract per-position draft
+                // top-M from the (target-vocab) draft logits, remap so verify
+                // position p uses draft row min(p+1, q_len-1) (the calibrated
+                // alignment), then fused Q6_K gather/dot/argmax over the M rows.
+                auto Th0 = sync_us();
+                const int dvocab = (int)draft_sg.logits->ne[0];
+                // All on the default stream, no intermediate syncs: extract →
+                // remap → fused head → D2H (the copy forces completion).
+                dflash::common::extract_topm_cuda(
+                    (const float *)draft_sg.logits->data, dvocab, q_len, g_topk_head_M,
+                    d_cand, d_topm_scr, 0);
+                for (int pp = 0; pp < q_len; pp++) {
+                    const int src = std::min(pp + 1, q_len - 1);
+                    cudaMemcpyAsync(d_cand_use + (size_t)pp * g_topk_head_M,
+                                    d_cand + (size_t)src * g_topk_head_M,
+                                    (size_t)g_topk_head_M * sizeof(int32_t),
+                                    cudaMemcpyDeviceToDevice, 0);
+                }
+                dflash::common::restricted_lm_head_q6k(
+                    w.output->data, (int)w.output->ne[0], (int)w.output->ne[1],
+                    (const float *)sg.hidden_states->data, q_len,
+                    d_cand_use, g_topk_head_M, d_head_tok, d_head_keys, 0);
+                cudaMemcpy(target_tok.data(), d_head_tok, sizeof(int32_t) * q_len,
+                           cudaMemcpyDeviceToHost);
+                tt_head_kernel  += std::chrono::duration<double, std::micro>(sync_us() - Th0).count();
+                head_steps++;
+            } else
+#endif
+            {
             ggml_backend_tensor_get(sg.argmax_tokens, target_tok.data(), 0,
                                     sizeof(int32_t) * q_len);
             // Calibration: the batched path normally reads only the GPU argmax.
@@ -3792,6 +3894,7 @@ int main(int argc, char ** argv) {
             if (g_topk_calib) {
                 ggml_backend_tensor_get(sg.logits, verify_logits_buf.data(), 0,
                                         sizeof(float) * (size_t)vocab * q_len);
+            }
             }
         } else {
             // Sequential verify: q_len independent single-token decodes.
@@ -4219,6 +4322,12 @@ int main(int argc, char ** argv) {
     std::printf("  verify_set     %.2f\n", avg_ms(tt_verify_set));
     std::printf("  verify_compute %.2f\n", avg_ms(tt_verify_compute));
     std::printf("  verify_logits  %.2f\n", avg_ms(tt_verify_logits));
+    if (head_steps > 0) {
+        std::printf("  [topk-head] M=%d steps=%ld  extract=%.3f ms/step  kernel=%.3f ms/step\n",
+                    g_topk_head_M, head_steps,
+                    tt_head_extract / 1000.0 / head_steps,
+                    tt_head_kernel  / 1000.0 / head_steps);
+    }
     std::printf("  accept         %.2f\n", avg_ms(tt_accept));
     std::printf("  restore_ssm    %.2f\n", avg_ms(tt_restore));
     std::printf("  replay_build   %.2f\n", avg_ms(tt_replay_build));
