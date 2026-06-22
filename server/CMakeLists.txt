@@ -596,6 +596,21 @@ if(DFLASH27B_TESTS)
         set_target_properties(test_flashprefill_kernels PROPERTIES CUDA_ARCHITECTURES "${_dflash_archs}")
         target_include_directories(test_flashprefill_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common CUDA::cudart)
+    elseif(DFLASH27B_GPU_BACKEND STREQUAL "hip" AND DFLASH27B_HIP_SM80_EQUIV AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_flashprefill_kernels.cpp")
+        # HIP build of the rocWMMA flashprefill numerics test. The test source is
+        # written in CUDA spellings; the hip_compat/ shim maps cuda_runtime.h /
+        # cuda_bf16.h and the cuda* APIs onto HIP, exactly as the kernel sources
+        # do. Only meaningful when Phase 2 (rocWMMA) is enabled, since that is
+        # what provides the launch_*_bf16 symbols in dflash_common. Lets the
+        # rocWMMA path be validated on AMD (gfx1100 / gfx1151 / gfx12xx incl.
+        # the R9700) instead of CUDA-only.
+        add_executable(test_flashprefill_kernels test/test_flashprefill_kernels.cpp)
+        set_source_files_properties(test/test_flashprefill_kernels.cpp PROPERTIES LANGUAGE HIP)
+        set_target_properties(test_flashprefill_kernels PROPERTIES HIP_ARCHITECTURES "${_dflash_archs}")
+        target_include_directories(test_flashprefill_kernels PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/hip_compat)
+        target_link_libraries(test_flashprefill_kernels PRIVATE dflash_common ${DFLASH27B_GGML_BACKEND_TARGET})
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kv_quant.cpp")
         add_executable(test_kv_quant test/test_kv_quant.cpp)

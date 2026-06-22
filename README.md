@@ -92,6 +92,7 @@ Reference target: **RTX 3090 (Ampere sm_86)** — all headline numbers. Other NV
 | <img src="assets/gpus/v100.png" width="750" /> | Volta `sm_70` / Pascal `sm_61` | V100, P40 | CUDA 12.0 | 🟡 fallback paths, unbenched | — |
 | <img src="assets/gpus/ryze395.png" width="750" /> | RDNA3.5 `gfx1151` | Ryzen AI MAX+ 395 / Strix Halo | ROCm 6+ | ✅ 37 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
 | <img src="assets/gpus/7900xtx.png" width="750" /> | RDNA3 `gfx1100` | Radeon RX 7900 XTX | ROCm 6+ | ✅ 50 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
+| — | RDNA4 `gfx1201` | Radeon AI PRO R9700 | ROCm 6.4+ | ✅ 55 tok/s HIP | [↗](server/README.md#amd-hip-backend-strix-halo-rx-7900-xtx) |
 
 `server/` (DFlash) builds with CMake 3.18+ and `--recurse-submodules` for `Luce-Org/llama.cpp@luce-dflash` — no PyTorch needed. `optimizations/megakernel/` is the only component requiring PyTorch 2.0+ (CUDAExtension links against torch C++ libs). Power-tune: `sudo nvidia-smi -pl 220` (3090 sweet spot, re-sweep for other cards).
 
