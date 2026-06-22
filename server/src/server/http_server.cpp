@@ -86,6 +86,28 @@ static inline const char* sock_strerror() { return strerror(errno); }
 
 namespace dflash::common {
 
+static std::string context_overflow_message(int max_ctx, int prompt_tokens, int max_output) {
+    const int requested_tokens = prompt_tokens + max_output;
+    return "This model's maximum context length is " + std::to_string(max_ctx) +
+           " tokens. However, you requested " + std::to_string(requested_tokens) +
+           " tokens (" + std::to_string(prompt_tokens) + " in the messages, " +
+           std::to_string(max_output) +
+           " in the completion). Please reduce the length of the messages or completion.";
+}
+
+static bool prompt_ends_in_open_think(const std::string & prompt) {
+    static constexpr const char * kThinkOpen = "<think>";
+    static constexpr size_t kThinkOpenLen = 7;
+    size_t end = prompt.size();
+    while (end > 0) {
+        char c = prompt[end - 1];
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') break;
+        --end;
+    }
+    return end >= kThinkOpenLen &&
+           prompt.compare(end - kThinkOpenLen, kThinkOpenLen, kThinkOpen) == 0;
+}
+
 // ─── piecewise keep-ratio curve ─────────────────────────────────────────
 
 static float pflash_keep_ratio(const ServerConfig & cfg, int n_tokens) {
@@ -1691,6 +1713,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
                                             true, enable_thinking,
                                             tools_json);
         }
+        req.started_in_thinking = prompt_ends_in_open_think(rendered);
         req.prompt_tokens = tokenizer_.encode(rendered);
 
         // count_tokens: short-circuit after tokenization. Skip generation
@@ -1716,14 +1739,16 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
              n_prompt >= config_.pflash_threshold);
         if (should_reject_oversized(n_prompt, req.max_output,
                                     config_.max_ctx, pflash_will_run)) {
-            send_error(fd, 400, "prompt + max_tokens exceeds context window");
+            send_error(fd, 400,
+                       context_overflow_message(config_.max_ctx, n_prompt,
+                                                req.max_output));
             return true;
         }
     }
 
     std::fprintf(stderr,
         "[server] chat %s format=%s stream=%s msgs=%zu tools=%zu prompt_tokens=%zu "
-        "max_tokens=%d max_ctx=%d thinking=%s stops=%zu model=%s\n",
+        "max_tokens=%d max_ctx=%d thinking=%s started_in_thinking=%s stops=%zu model=%s\n",
         req.response_id.c_str(),
         api_format_name(req.format),
         req.stream ? "true" : "false",
@@ -1733,6 +1758,7 @@ bool HttpServer::route_request(int fd, const HttpRequest & hr) {
         req.max_output,
         config_.max_ctx,
         req.thinking_enabled ? "true" : "false",
+        req.started_in_thinking ? "true" : "false",
         req.stop_sequences.size(),
         req.model.c_str());
 
@@ -1839,7 +1865,8 @@ void HttpServer::worker_loop() {
         SseEmitter emitter(req.format, req.response_id, req.model,
                            (int)req.prompt_tokens.size(), req.tools,
                            &tool_memory_,
-                           req.stop_sequences);
+                           req.stop_sequences,
+                           req.started_in_thinking);
 
         // Emit initial SSE events (skip when proxying).
         if (req.stream && config_.pflash_upstream_base.empty()) {
@@ -2250,7 +2277,11 @@ void HttpServer::worker_loop() {
         if (effective_prompt_overflows((int)effective_prompt.size(),
                                        pflash_full_cache_served_tokens,
                                        req.max_output, config_.max_ctx)) {
-            fail_request(400, "effective prompt + max_tokens exceeds context window after compression");
+            const int prompt_len = pflash_full_cache_served_tokens >= 0
+                ? pflash_full_cache_served_tokens
+                : (int)effective_prompt.size();
+            fail_request(400, context_overflow_message(config_.max_ctx, prompt_len,
+                                                       req.max_output));
             continue;
         }
 
