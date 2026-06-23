@@ -1,5 +1,14 @@
 # HIP perf — diagnosis + kernel-side optimization plan
 
+> **Update 2026-06-23 — RDNA MMQ tile override shipped (via submodule bump).**
+> A `48×64`/4-warp MMQ tile for the small DFlash verify batches (vs the stock
+> `128×128`/8) lands in the `luce-dflash` llama.cpp submodule
+> (Luce-Org/llama.cpp-dflash-ggml#18). Measured on Qwen3.6-27B Q4_K_M,
+> `--ddtree-budget=22`, 10-prompt HE mean, output bit-identical:
+> **gfx1201 (R9700) 54.65 → 59.37 tok/s (+8.3%)**, **gfx1100 (RX 7900 XTX)
+> 56.78 → 60.18 tok/s (+6.0%)**. This is the cycle-9 idea generalized to
+> budget=22 and to RDNA4; gfx1151/RDNA3.5 stays on the default (untested).
+
 _Drafted 2026-05-11 against `Luce-Org/lucebox-hub` post-#122 with HIP/ROCm
 support landing in the upcoming PR. Numbers below are from the canonical
 DFlash bench (Qwen3.6-27B-Q4_K_M + z-lab DFlash drafter,
