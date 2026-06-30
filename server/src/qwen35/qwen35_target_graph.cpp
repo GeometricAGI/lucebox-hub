@@ -513,9 +513,12 @@ bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
 static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
                                       const TargetLayer & L) {
     ggml_tensor * gate = apply_scale2(ctx, ggml_mul_mat(ctx, L.w_gate, cur), L.w_gate_s);   // [inter, n_tokens]
-    gate = ggml_silu(ctx, gate);
-    ggml_tensor * up = apply_scale2(ctx, ggml_mul_mat(ctx, L.w_up, cur), L.w_up_s);
-    ggml_tensor * gu = ggml_mul(ctx, gate, up);
+    ggml_tensor * up   = apply_scale2(ctx, ggml_mul_mat(ctx, L.w_up, cur), L.w_up_s);
+    // silu(gate) * up, fused: gate & up share `cur`, so the backend collapses
+    // gate-proj + up-proj + swiglu into one MUL_MAT+MUL_MAT+GLU kernel (matches
+    // the MoE path in qwen35moe_ffn). For non-NVFP4 weights apply_scale2 is a
+    // no-op, so the two matmuls feed the GLU directly.
+    ggml_tensor * gu = ggml_swiglu_split(ctx, gate, up);
     return apply_scale2(ctx, ggml_mul_mat(ctx, L.w_down, gu), L.w_down_s);                  // [hidden, n_tokens]
 }
 

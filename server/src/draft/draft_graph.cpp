@@ -91,14 +91,13 @@ DraftGraphOutputs build_draft_graph(
                 target_feat->nb[1], target_feat->nb[2],
                 target_feat->nb[1] * ctx_offset);
         }
-        ggml_tensor * Kctx = ggml_mul_mat(ctx, L.wk, tf);  // [kv_dim, eff_ctx, 1]
-        ggml_tensor * Kn   = ggml_mul_mat(ctx, L.wk, hn);  // [kv_dim, q_len,   1]
-        ggml_tensor * Vctx = ggml_mul_mat(ctx, L.wv, tf);
-        ggml_tensor * Vn   = ggml_mul_mat(ctx, L.wv, hn);
-
-        // concat along ne[1] (sequence) — ggml_concat second arg dim=1
-        ggml_tensor * K = ggml_concat(ctx, Kctx, Kn, 1);  // [kv_dim, eff_total_k, 1]
-        ggml_tensor * V = ggml_concat(ctx, Vctx, Vn, 1);
+        // Concat the context + noise inputs once along ne[1] (sequence), then
+        // project. mul_mat is per-column, so wk@concat[tf,hn] == concat[wk@tf,
+        // wk@hn]; this halves the K/V matmuls (4 -> 2) and drops one of the two
+        // post-projection concats (kv_in is shared by K and V).
+        ggml_tensor * kv_in = ggml_concat(ctx, tf, hn, 1);  // [hidden, eff_total_k, 1]
+        ggml_tensor * K = ggml_mul_mat(ctx, L.wk, kv_in);   // [kv_dim, eff_total_k, 1]
+        ggml_tensor * V = ggml_mul_mat(ctx, L.wv, kv_in);
 
         // Per-head k_norm
         K = ggml_reshape_3d(ctx, K, head_dim, n_kv, eff_total_k);
@@ -158,9 +157,10 @@ DraftGraphOutputs build_draft_graph(
         //     w_gate, w_up: [hidden, intermediate]
         //     w_down:       [intermediate, hidden]
         ggml_tensor * g  = ggml_mul_mat(ctx, L.w_gate, hf);  // [inter, q_len]
-        g = ggml_silu(ctx, g);
         ggml_tensor * u  = ggml_mul_mat(ctx, L.w_up,   hf);  // [inter, q_len]
-        ggml_tensor * gu = ggml_mul(ctx, g, u);
+        // silu(g) * u, fused: with both projections sharing `hf`, the backend
+        // collapses gate-proj + up-proj + swiglu (MUL_MAT+MUL_MAT+GLU) into one kernel.
+        ggml_tensor * gu = ggml_swiglu_split(ctx, g, u);
         ggml_tensor * ffn_out = ggml_mul_mat(ctx, L.w_down, gu);  // [hidden, q_len]
 
         h = ggml_add(ctx, h, ffn_out);

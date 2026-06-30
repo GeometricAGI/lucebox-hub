@@ -3441,14 +3441,20 @@ int main(int argc, char ** argv) {
             tt_verify_compute += std::chrono::duration<double, std::micro>(T_verify_compute - T_verify_set).count();
 
             // DDTree posterior: per-node argmax over the verify logits.
-            //   default        : full vocab×N D2H + CPU argmax (legacy).
-            //   GPU_VERIFY_ARGMAX=1: read the in-graph batched GPU argmax
-            //                        (tree_verify_argmax) — N int32s, no bulk D2H.
-            //   GPU_VERIFY_ARGMAX=2: run BOTH and report per-step mismatches
-            //                        (validates the historical "-1 / tie" concern).
+            //
+            // build_target_step_tree ALWAYS appends ggml_argmax(logits) to the
+            // graph (tree_verify_argmax), so the per-node argmax is computed
+            // on-GPU every step regardless. The tree skeleton is argmax even
+            // under sampling (sampling only redraws the bonus token, fetched as
+            // a single row below), so reading those N int32s is sufficient and
+            // avoids a redundant vocab×N (~14 MB) D2H plus a CPU argmax over the
+            // same data — i.e. recomputing on the host what the GPU already did.
+            // This is the default; DFLASH_GPU_VERIFY_ARGMAX overrides it:
+            //   0 → legacy full-logits D2H + CPU argmax (debug/bit-compat),
+            //   2 → run BOTH and report per-step mismatches (tie/-1 validation).
             static const int kGpuVerifyArgmax = [](){
                 const char * v = std::getenv("DFLASH_GPU_VERIFY_ARGMAX");
-                return v ? std::atoi(v) : 0;
+                return v ? std::atoi(v) : 1;
             }();
             std::vector<int32_t> posterior(N_actual);
             bool logits_resident = false;  // verify_logits_buf populated this step?
