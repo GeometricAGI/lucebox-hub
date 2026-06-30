@@ -283,6 +283,33 @@ The draft-token top-K extraction and the per-step verify argmax used to run on t
 
 To reproduce the benchmark: baseline `DFLASH_GPU_DRAFT_TOPK=0 DFLASH_GPU_VERIFY_ARGMAX=0`, optimized `DFLASH_GPU_DRAFT_TOPK=1 DFLASH_GPU_VERIFY_ARGMAX=1`, both via `python server/scripts/bench_llm.py --bench HumanEval`.
 
+| Env | Default | Effect |
+|---|---|---|
+| `DFLASH_TOPK_SPLIT=N` | auto-tuned | Override the split-K factor (blocks per draft position) for the GPU top-K kernel; auto-tune aims for ~240 total blocks across the device. Useful to re-sweep on a GPU with a different SM count. |
+| `DFLASH_TOPK_PROFILE=1` | off | Print per-launch CUDA event timing (partial pass + combine pass) for the GPU top-K kernel to stderr. |
+
+**GPU sampler (DFlash)**
+
+The CPU `sample_logits` chain (repetition/frequency/presence penalty → softmax(temp) → top_p nucleus → multinomial draw) requires a full vocab-wide D2H logits copy every token. `geometric_sampler_cuda.cu` ports penalty application, the softmax reductions, and the draw onto the GPU, reading logits straight off the device tensor in the qwen35 decode loop (skipping that D2H) when enabled. It's an **opt-in** runtime flag (off by default), compiled in by default on CUDA builds. `top_k>0` and nucleus `top_p<1` always fall back to the CPU chain — a single-block bisection threshold search over the full vocab is slower there than the CPU's `partial_sort`, so only greedy and temperature/penalty sampling are routed to the GPU.
+
+| Env / flag | Default | Effect |
+|---|---|---|
+| `DFLASH_GPU_SAMPLE=1` | off | Opt into the GPU `sample_logits` path at runtime. Falls back to the CPU chain per call when the config is unsupported (`top_k>0`, nucleus `top_p<1`) or on any CUDA error. |
+| `DFLASH_GPU_SAMPLER` (CMake option) | `ON` | Build-time switch; compiles `src/common/geometric_sampler_cuda.cu` into `dflash_common`. Configure with `-DDFLASH_GPU_SAMPLER=OFF` to drop the kernel entirely. |
+| `--samp=temp,top_p,top_k,rep_pen,seed[,freq,pres]` (`test_dflash`) | greedy | Exercise the sampler chain (and its GPU port, gated by `DFLASH_GPU_SAMPLE`) in the positional (non-daemon) harness instead of greedy decode. Same field order as the daemon's ` samp=` request-line tail. |
+| `DFLASH_SAMP=...` / `DFLASH_N_SAMPLE=N` (`bench_llm.py`) | off / `10` | Forward the same `temp,top_p,top_k,rep_pen,seed[,freq,pres]` tail to every DFlash bench call, and override the per-dataset prompt count. AR (`test_generate`) is greedy-only and ignores `DFLASH_SAMP`. |
+
+Per-call sampler-only latency, CPU chain vs GPU (device-resident logits), measured on an RTX 3090 at the Qwen3 vocab (151,936):
+
+| Config | CPU | GPU (devptr) | Speedup |
+|---|---|---|---|
+| greedy (temp=0) | 12.0 µs | 0.06 µs | ~215× |
+| temp=0.8 | 13.0 µs | 1.85 µs | ~7.0× |
+| temp=0.8 + rep_pen=1.2 | 14.3 µs | 1.88 µs | ~7.6× |
+| temp=0.8 + top_p=0.95 (nucleus) | 13.2 µs | 32.0 µs | 0.41× — stays on CPU |
+
+Reproduce the microbench: `DFLASH_SAMPLER_BENCH=1 ./build/test_server_unit` (env-gated, prints to stderr). End-to-end: `DFLASH_GPU_SAMPLE=1 DFLASH_SAMP=0.8,1.0,0,1.1,42 python server/scripts/bench_llm.py --bench HumanEval` vs the same command with `DFLASH_GPU_SAMPLE=0`.
+
 **Prefill compression (PFlash)**
 
 | Flag / env | Default | Effect |

@@ -10,7 +10,7 @@
 #include <utility>
 
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
-#include "sampler_cuda.h"
+#include "geometric_sampler_cuda.h"
 #endif
 
 namespace dflash::common {
@@ -30,7 +30,7 @@ int sample_logits(const float * logits_in,
             std::uniform_real_distribution<double> u(0.0, 1.0);
             r = u(rng);
         }
-        const int g = sample_logits_cuda(logits_in, vocab, cfg, history, r,
+        const int g = geometric_sample_logits_cuda(logits_in, vocab, cfg, history, r,
                                          /*logits_on_device=*/false);
         if (g >= 0) return g;
     }

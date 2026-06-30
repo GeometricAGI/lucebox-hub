@@ -19,7 +19,7 @@
 #include "server/chat_template.h"
 #include "common/sampler.h"
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
-#include "common/sampler_cuda.h"
+#include "common/geometric_sampler_cuda.h"
 #include <cuda_runtime.h>
 #include <chrono>
 #endif
@@ -3263,7 +3263,7 @@ static void test_sampler_needs_logit_processing() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// GPU sampler (sampler_cuda.cu) — compared against the CPU chain.
+// GPU sampler (geometric_sampler_cuda.cu) — compared against the CPU chain.
 // All tests self-skip when the build has no GPU sampler or no CUDA device.
 // ═══════════════════════════════════════════════════════════════════════
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
@@ -3323,7 +3323,7 @@ static void test_gpu_sampler_greedy_matches_cpu() {
         std::vector<int32_t> history;
         std::mt19937_64 rng(seed);
         const int cpu_tok = sample_logits(logits.data(), vocab, cfg, history, rng);
-        const int gpu_tok = sample_logits_cuda(logits.data(), vocab, cfg, history,
+        const int gpu_tok = geometric_sample_logits_cuda(logits.data(), vocab, cfg, history,
                                                0.0, /*on_device=*/false);
         TEST_ASSERT_MSG(gpu_tok == cpu_tok, "greedy GPU token must equal CPU argmax");
     }
@@ -3346,7 +3346,7 @@ static void test_gpu_sampler_greedy_penalties_match_cpu() {
         cfg.rep_pen = c.rep; cfg.freq_pen = c.freq; cfg.pres_pen = c.pres;
         std::mt19937_64 rng(7);
         const int cpu_tok = sample_logits(logits.data(), vocab, cfg, history, rng);
-        const int gpu_tok = sample_logits_cuda(logits.data(), vocab, cfg, history,
+        const int gpu_tok = geometric_sample_logits_cuda(logits.data(), vocab, cfg, history,
                                                0.0, /*on_device=*/false);
         TEST_ASSERT_MSG(gpu_tok == cpu_tok, "greedy+penalties GPU token must equal CPU");
     }
@@ -3359,7 +3359,7 @@ static void test_gpu_sampler_top_k_falls_back() {
     auto logits = gpu_test_logits(vocab, 5);
     SamplerCfg cfg; cfg.temp = 1.0f; cfg.top_k = 10;
     std::vector<int32_t> history;
-    const int gpu_tok = sample_logits_cuda(logits.data(), vocab, cfg, history,
+    const int gpu_tok = geometric_sample_logits_cuda(logits.data(), vocab, cfg, history,
                                            0.3, /*on_device=*/false);
     TEST_ASSERT_MSG(gpu_tok == -1, "top_k>0 must return -1 (CPU fallback)");
 }
@@ -3374,7 +3374,7 @@ static double gpu_empirical_l1(const std::vector<float> & logits, const SamplerC
     std::vector<int32_t> history;
     int valid = 0;
     for (int i = 0; i < n_draws; i++) {
-        const int tok = sample_logits_cuda(logits.data(), (int)logits.size(), cfg,
+        const int tok = geometric_sample_logits_cuda(logits.data(), (int)logits.size(), cfg,
                                            history, u(rng), /*on_device=*/false);
         if (tok >= 0 && tok < (int)logits.size()) { hist[tok]++; valid++; }
     }
@@ -3414,7 +3414,7 @@ static void test_gpu_sampler_top_p_distribution() {
     const int n = 120000;
     int valid = 0, out_of_nucleus = 0;
     for (int i = 0; i < n; i++) {
-        const int tok = sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
+        const int tok = geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
         if (tok < 0 || tok >= vocab) continue;
         valid++; hist[tok]++;
         if (nucleus[tok] == 0.0) out_of_nucleus++;
@@ -3443,7 +3443,7 @@ static void test_gpu_sampler_modal_token_matches_cpu() {
         std::vector<int> hist(vocab, 0);
         for (int i = 0; i < 60000; i++) {
             const int tok = gpu
-                ? sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false)
+                ? geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false)
                 : sample_logits(logits.data(), vocab, cfg, history, rng);
             if (tok >= 0 && tok < vocab) hist[tok]++;
         }
@@ -3477,17 +3477,17 @@ static void gpu_sampler_microbench() {
         std::mt19937_64 rng(1);
         std::uniform_real_distribution<double> u(0.0, 1.0);
         for (int i = 0; i < 30; i++) sink += sample_logits(logits.data(), vocab, cfg, history, rng);
-        for (int i = 0; i < 30; i++) sink += sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
+        for (int i = 0; i < 30; i++) sink += geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
         auto t0 = now();
         for (int i = 0; i < iters; i++) sink += sample_logits(logits.data(), vocab, cfg, history, rng);
         auto t1 = now();
-        for (int i = 0; i < iters; i++) sink += sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
+        for (int i = 0; i < iters; i++) sink += geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
         auto t2 = now();
         double dev_us = -1.0;
         if (have_dev) {
-            for (int i = 0; i < 30; i++) sink += sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
+            for (int i = 0; i < 30; i++) sink += geometric_sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
             auto t3 = now();
-            for (int i = 0; i < iters; i++) sink += sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
+            for (int i = 0; i < iters; i++) sink += geometric_sample_logits_cuda(d_logits, vocab, cfg, history, u(rng), true);
             auto t4 = now();
             dev_us = us(t3, t4) / iters;
         }

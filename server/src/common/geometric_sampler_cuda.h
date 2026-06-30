@@ -37,7 +37,7 @@ namespace dflash::common {
 //                      false -> `logits` is host memory and is uploaded H2D.
 //   r_uniform        : a pre-drawn uniform in [0,1) from the caller's RNG;
 //                      ignored for greedy (cfg.temp <= 0).
-int sample_logits_cuda(const float * logits,
+int geometric_sample_logits_cuda(const float * logits,
                        int vocab,
                        const SamplerCfg & cfg,
                        const std::vector<int32_t> & history,

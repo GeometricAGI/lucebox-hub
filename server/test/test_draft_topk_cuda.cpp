@@ -1,6 +1,6 @@
 // Correctness test for geometric_extract_draft_topk_cuda (GPU) vs extract_draft_topk (CPU).
 //
-// The GPU kernel in src/common/draft_topk_cuda.cu is a drop-in replacement for
+// The GPU kernel in src/common/geometric_draft_topk_cuda.cu is a drop-in replacement for
 // the CPU top-K + online-logsumexp path in ddtree.cpp. This test feeds the same
 // random logits to both and asserts the GPU results match the CPU reference:
 //   - token ids identical (rank by rank, per position)
@@ -124,7 +124,7 @@ int main() {
         return 0;
     }
 
-    // The kernel supports K up to kMaxK (=8 in draft_topk_cuda.cu); larger K is
+    // The kernel supports K up to kMaxK (=8 in geometric_draft_topk_cuda.cu); larger K is
     // handled by a documented CPU fallback (returns false), checked separately.
     const Case cases[] = {
         // Realistic decode shape: Qwen3.5 vocab, small position batch.

@@ -9,7 +9,7 @@
 #include "attn_masks.h"
 #include "common/sampler.h"
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
-#include "common/sampler_cuda.h"
+#include "common/geometric_sampler_cuda.h"
 #include <random>
 #endif
 #include "common/io_utils.h"
@@ -1603,7 +1603,7 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                     std::uniform_real_distribution<double> u(0.0, 1.0);
                     r = u(sampler_rng_);
                 }
-                g_tok = sample_logits_cuda(
+                g_tok = geometric_sample_logits_cuda(
                     static_cast<const float *>(sg_.logits->data), vocab, sampler_,
                     out_tokens, r, /*logits_on_device=*/true);
             }

@@ -1,4 +1,4 @@
-// CUDA port of the sample_logits chain. See sampler_cuda.h for the contract and
+// CUDA port of the sample_logits chain. See geometric_sampler_cuda.h for the contract and
 // the CPU/GPU split rationale, and sampler.cpp for the reference CPU chain this
 // mirrors: rep_penalty -> freq/pres_penalty -> softmax(temp) -> top_p -> draw.
 //
@@ -7,9 +7,9 @@
 // the nucleus threshold search and the inverse-CDF scan in shared memory with no
 // cross-block synchronization, which is far simpler and — for one row per token
 // — fast enough. (The bandwidth-bound multi-block split used by
-// draft_topk_cuda.cu pays off only for many rows at once.)
+// geometric_draft_topk_cuda.cu pays off only for many rows at once.)
 
-#include "sampler_cuda.h"
+#include "geometric_sampler_cuda.h"
 
 #include <cuda_runtime.h>
 #include <cfloat>
@@ -33,7 +33,7 @@ constexpr int kBlock = 1024;  // threads per block (power of two for reductions)
 // (or 1.0 to disable); `add[t]` folds freq_pen*count + pres_pen for that token.
 // Order matches the CPU chain: multiplicative repetition penalty first, then the
 // additive frequency/presence subtraction.
-__global__ void apply_penalties(float * __restrict__ work,
+__global__ void geometric_apply_penalties(float * __restrict__ work,
                                 const int32_t * __restrict__ ids,
                                 const float * __restrict__ add,
                                 int m, float rep_pen, int rep_active) {
@@ -49,7 +49,7 @@ __global__ void apply_penalties(float * __restrict__ work,
 // Single-block sampler. work[] holds the post-penalty logits. Writes the chosen
 // token id to *out. do_sample==0 -> greedy argmax (lowest id wins ties, matching
 // the CPU manual-argmax and DFLASH_GPU_ARGMAX behaviour).
-__global__ void sample_kernel(const float * __restrict__ work, int vocab,
+__global__ void geometric_sample_kernel(const float * __restrict__ work, int vocab,
                               float inv_t, int do_sample, float top_p,
                               double r_uniform, int32_t * __restrict__ out) {
     const int t     = threadIdx.x;
@@ -186,7 +186,7 @@ __global__ void sample_kernel(const float * __restrict__ work, int vocab,
 }
 
 // Per-device persistent scratch. The decode loop is single-threaded, so a plain
-// static cache avoids a cudaMalloc/cudaFree per token (mirrors draft_topk_cuda).
+// static cache avoids a cudaMalloc/cudaFree per token (mirrors geometric_draft_topk_cuda).
 struct Scratch {
     int       device   = -1;
     int       vocab_cap = 0;
@@ -237,7 +237,7 @@ bool gpu_sampler_enabled() {
     return on;
 }
 
-int sample_logits_cuda(const float * logits,
+int geometric_sample_logits_cuda(const float * logits,
                        int vocab,
                        const SamplerCfg & cfg,
                        const std::vector<int32_t> & history,
@@ -299,7 +299,7 @@ int sample_logits_cuda(const float * logits,
             cudaMemcpy(g_scratch.d_pen_add, pen_add.data(), (size_t)m * sizeof(float),
                        cudaMemcpyHostToDevice);
             const int blocks = (m + kBlock - 1) / kBlock;
-            apply_penalties<<<blocks, kBlock>>>(g_scratch.d_work, g_scratch.d_pen_id,
+            geometric_apply_penalties<<<blocks, kBlock>>>(g_scratch.d_work, g_scratch.d_pen_id,
                                                 g_scratch.d_pen_add, m, cfg.rep_pen,
                                                 rep_active ? 1 : 0);
         }
@@ -307,7 +307,7 @@ int sample_logits_cuda(const float * logits,
             const int   do_sample = (cfg.temp > 0.0f) ? 1 : 0;
             const float inv_t     = 1.0f / fmaxf(1e-3f, cfg.temp);
             const float top_p     = (cfg.top_p > 0.0f && cfg.top_p < 1.0f) ? cfg.top_p : 1.0f;
-            sample_kernel<<<1, kBlock>>>(g_scratch.d_work, vocab, inv_t, do_sample,
+            geometric_sample_kernel<<<1, kBlock>>>(g_scratch.d_work, vocab, inv_t, do_sample,
                                          top_p, r_uniform, g_scratch.d_out);
             int32_t tok = -1;
             if (cudaGetLastError() == cudaSuccess &&
