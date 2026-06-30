@@ -51,7 +51,7 @@ uv sync --extra megakernel    # also compile the megakernel CUDA extension
 bash scripts/check_uv_workspace.sh  # lockfile + frozen-sync import smoke
 
 # C++/CUDA decoder
-cmake -B server/build -S dflash -DCMAKE_BUILD_TYPE=Release
+cmake -B server/build -S server -DCMAKE_BUILD_TYPE=Release
 cmake --build server/build --target test_dflash -j
 ```
 

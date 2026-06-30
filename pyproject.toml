@@ -8,6 +8,7 @@ license = { text = "Apache-2.0" }
 authors = [{ name = "Lucebox" }]
 
 dependencies = [
+    "click>=8.4.2",
     "lucebox-dflash",
     "pflash",
 ]

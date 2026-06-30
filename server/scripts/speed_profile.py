@@ -30,7 +30,7 @@ Design choices
 
 Usage
 -----
-  python3 profile.py \
+  python3 speed_profile.py \
       --target /opt/models/Qwen3.6-27B-Q4_K_M.gguf \
       --draft  /opt/models/draft/dflash-draft-3.6-q4_k_m.gguf \
       --n-gen 128 --budget 22 --reps 5 --nsys \
@@ -41,6 +41,8 @@ Usage
 from __future__ import annotations
 import argparse, atexit, csv, datetime, json, os, re, shutil, statistics, struct, subprocess, sys, tempfile
 from pathlib import Path
+
+_SCRIPT_ROOT = Path(__file__).resolve().parent.parent  # server/
 
 # --------------------------------------------------------------------------------------
 # Canonical prompts (HumanEval-style completion). Override with --prompts <file.jsonl>
@@ -613,8 +615,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
     ap.add_argument("--draft", required=True)
-    ap.add_argument("--df-bin", default=os.environ.get("DFLASH_BIN", "build/test_dflash"))
-    ap.add_argument("--ar-bin", default=os.environ.get("DFLASH_BIN_AR", "build/test_generate"))
+    _BIN_SUFFIX = ".exe" if os.name == "nt" else ""
+    ap.add_argument("--df-bin", default=os.environ.get("DFLASH_BIN", str(_SCRIPT_ROOT / "build" / f"test_dflash{_BIN_SUFFIX}")))
+    ap.add_argument("--ar-bin", default=os.environ.get("DFLASH_BIN_AR", str(_SCRIPT_ROOT / "build" / f"test_generate{_BIN_SUFFIX}")))
     ap.add_argument("--tokenizer", default=os.environ.get("DFLASH_TOKENIZER", "Qwen/Qwen3.6-27B"))
     ap.add_argument("--n-gen", type=int, default=128,
                     help="requested generated tokens per benchmark prompt")

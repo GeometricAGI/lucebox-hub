@@ -123,32 +123,98 @@ static bool feature_row_to_host_f32(ggml_type type,
     return dequantize_feature_type_to_host_f32(type, src, dst, elems);
 }
 
-static bool convert_device_f32_to_feature_type(DraftFeatureMirror & mirror,
-                                               const void * src,
-                                               int src_device,
-                                               void * dst,
-                                               size_t elems) {
-    if (mirror.storage_type == GGML_TYPE_F32) {
-        return copy_peer_async(dst, mirror.device, src, src_device,
-                               elems * sizeof(float));
-    }
+static bool convert_device_f32_rows_to_feature_type(DraftFeatureMirror & mirror,
+                                                    const void * src,
+                                                    int src_device,
+                                                    size_t src_stride,
+                                                    void * dst,
+                                                    size_t dst_stride,
+                                                    size_t rows,
+                                                    size_t elems_per_row) {
+    if (rows == 0) return true;
 
-    std::vector<float> host(elems);
+    const size_t src_row_bytes = elems_per_row * sizeof(float);
+    const size_t dst_row_bytes = ggml_row_size(mirror.storage_type, (int64_t)elems_per_row);
+
+    // NOTE: The same-device F32 fast path (D2D async) is handled directly by
+    // copy_capture_slice_to_draft_ring on the copy stream.  This function is
+    // now only the fallback for cross-device or non-F32 scenarios.
+
+    std::vector<float> host(rows * elems_per_row);
     cudaError_t err = cudaSetDevice(src_device);
     if (err != cudaSuccess) return false;
-    err = cudaMemcpy(host.data(), src, elems * sizeof(float),
-                     cudaMemcpyDeviceToHost);
+    err = cudaMemcpy2D(host.data(), src_row_bytes,
+                       src, src_stride,
+                       src_row_bytes, rows,
+                       cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) return false;
 
-    const size_t row_bytes = ggml_row_size(mirror.storage_type, (int64_t)elems);
-    std::vector<uint8_t> tmp(row_bytes);
-    if (!host_f32_to_feature_row(mirror.storage_type, host.data(), tmp.data(), elems)) {
-        return false;
+    if (mirror.storage_type == GGML_TYPE_F32) {
+        err = cudaSetDevice(mirror.device);
+        if (err != cudaSuccess) return false;
+        err = cudaMemcpy2D(dst, dst_stride,
+                           host.data(), src_row_bytes,
+                           src_row_bytes, rows,
+                           cudaMemcpyHostToDevice);
+        return err == cudaSuccess;
     }
-    ggml_backend_tensor_set(mirror.target_feat, tmp.data(),
-                            (size_t)((char *)dst - (char *)mirror.target_feat->data),
-                            row_bytes);
-    return true;
+
+    std::vector<uint8_t> packed(rows * dst_row_bytes);
+    for (size_t row = 0; row < rows; ++row) {
+        const float * src_row = host.data() + row * elems_per_row;
+        void * dst_row = packed.data() + row * dst_row_bytes;
+        if (!host_f32_to_feature_row(mirror.storage_type, src_row, dst_row, elems_per_row)) {
+            return false;
+        }
+    }
+
+    err = cudaSetDevice(mirror.device);
+    if (err != cudaSuccess) return false;
+    err = cudaMemcpy2D(dst, dst_stride,
+                       packed.data(), dst_row_bytes,
+                       dst_row_bytes, rows,
+                       cudaMemcpyHostToDevice);
+    return err == cudaSuccess;
+}
+
+static bool copy_host_f32_rows_to_feature_type(DraftFeatureMirror & mirror,
+                                               const float * src,
+                                               size_t src_stride,
+                                               void * dst,
+                                               size_t dst_stride,
+                                               size_t rows,
+                                               size_t elems_per_row) {
+    if (rows == 0) return true;
+
+    const size_t src_row_bytes = elems_per_row * sizeof(float);
+    const size_t dst_row_bytes = ggml_row_size(mirror.storage_type, (int64_t)elems_per_row);
+
+    if (mirror.storage_type == GGML_TYPE_F32) {
+        cudaError_t err = cudaSetDevice(mirror.device);
+        if (err != cudaSuccess) return false;
+        err = cudaMemcpy2D(dst, dst_stride,
+                           src, src_stride,
+                           src_row_bytes, rows,
+                           cudaMemcpyHostToDevice);
+        return err == cudaSuccess;
+    }
+
+    std::vector<uint8_t> packed(rows * dst_row_bytes);
+    for (size_t row = 0; row < rows; ++row) {
+        const float * src_row = (const float *)((const char *)src + row * src_stride);
+        void * dst_row = packed.data() + row * dst_row_bytes;
+        if (!host_f32_to_feature_row(mirror.storage_type, src_row, dst_row, elems_per_row)) {
+            return false;
+        }
+    }
+
+    cudaError_t err = cudaSetDevice(mirror.device);
+    if (err != cudaSuccess) return false;
+    err = cudaMemcpy2D(dst, dst_stride,
+                       packed.data(), dst_row_bytes,
+                       dst_row_bytes, rows,
+                       cudaMemcpyHostToDevice);
+    return err == cudaSuccess;
 }
 
 static bool convert_bf16_feature_to_storage(DraftFeatureMirror & mirror,
@@ -159,6 +225,30 @@ static bool convert_bf16_feature_to_storage(DraftFeatureMirror & mirror,
     if (mirror.storage_type == GGML_TYPE_BF16) {
         return copy_peer_async(dst, mirror.device, src, src_device,
                                elems * sizeof(ggml_bf16_t));
+    }
+
+    // F32 storage (the default): widen bf16 -> f32 on-device with the same CUDA
+    // kernel the reader uses (copy_feature_to_f32), writing straight into the
+    // ring tensor.  This replaces a host round-trip (bf16 D2H -> CPU widen ->
+    // f32 H2D, chunked) with one on-GPU upconvert.  bf16 -> f32 is an exact
+    // widening, so the result is bit-identical to the host path.  Falls through
+    // to the host path if the CUDA converter is unavailable.
+    if (mirror.storage_type == GGML_TYPE_F32) {
+        if (auto to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16)) {
+            const void * s = src;
+            if (src_device != mirror.device) {
+                const size_t src_bytes = elems * sizeof(ggml_bf16_t);
+                if (!ensure_staging(mirror, src_bytes)) return false;
+                if (!copy_peer_async(mirror.staging, mirror.device, src, src_device,
+                                     src_bytes)) {
+                    return false;
+                }
+                s = mirror.staging;
+            }
+            if (cudaSetDevice(mirror.device) != cudaSuccess) return false;
+            to_f32(s, (float *)dst, (int64_t)elems, nullptr);
+            return cudaGetLastError() == cudaSuccess;
+        }
     }
 
     const size_t blck = (size_t)ggml_blck_size(mirror.storage_type);
@@ -237,6 +327,16 @@ void draft_feature_mirror_free(DraftFeatureMirror & mirror) {
         mirror.staging = nullptr;
         mirror.staging_bytes = 0;
     }
+    if (mirror.copy_stream) {
+        (void)cudaSetDevice(mirror.device);
+        (void)cudaStreamDestroy((cudaStream_t)mirror.copy_stream);
+        mirror.copy_stream = nullptr;
+    }
+    if (mirror.compute_done_event) {
+        (void)cudaSetDevice(mirror.device);
+        (void)cudaEventDestroy((cudaEvent_t)mirror.compute_done_event);
+        mirror.compute_done_event = nullptr;
+    }
     if (mirror.buf) {
         ggml_backend_buffer_free(mirror.buf);
         mirror.buf = nullptr;
@@ -301,6 +401,25 @@ bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
         return false;
     }
     mirror.cap = cap;
+
+    // Create a dedicated copy stream + event for async ring writes that overlap
+    // with the next layer's compute on the default stream.
+    cudaStream_t cs = nullptr;
+    err = cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        draft_feature_mirror_free(mirror);
+        return false;
+    }
+    mirror.copy_stream = (void *)cs;
+
+    cudaEvent_t ev = nullptr;
+    err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        draft_feature_mirror_free(mirror);
+        return false;
+    }
+    mirror.compute_done_event = (void *)ev;
+
     std::fprintf(stderr, "[dflash-feature] mirror dtype=%s cap=%d fc_in=%d\n",
                  ggml_type_name(mirror.storage_type), cap, fc_in);
     return true;
@@ -382,18 +501,59 @@ bool copy_capture_slice_to_draft_ring(
     const size_t dst_stride = feature_ring.target_feat->nb[1];
     const size_t src_stride = act_out->nb[1];
     const size_t row_elems = (size_t)hidden;
-    for (int i = 0; i < n_tokens; i++) {
-        const int slot = (start_pos + i) % feature_ring.cap;
-        const void * src = (const char *)act_out->data +
-            (size_t)(chunk_start + i) * src_stride;
-        void * dst = (char *)feature_ring.target_feat->data +
-            (size_t)slot * dst_stride +
-            (size_t)capture_idx * ggml_row_size(feature_ring.storage_type, hidden);
-        if (!convert_device_f32_to_feature_type(feature_ring, src, src_device, dst, row_elems)) {
-            return false;
-        }
+    const size_t dst_layer_offset =
+        (size_t)capture_idx * ggml_row_size(feature_ring.storage_type, hidden);
+
+    // Record an event on the default stream (where graph_compute just ran) so
+    // the copy stream can wait for the activations to be ready.
+    cudaStream_t cs = (cudaStream_t)feature_ring.copy_stream;
+    cudaEvent_t  ev = (cudaEvent_t)feature_ring.compute_done_event;
+    if (cs && ev) {
+        cudaError_t err = cudaSetDevice(src_device);
+        if (err != cudaSuccess) return false;
+        err = cudaEventRecord(ev, /*default stream=*/nullptr);
+        if (err != cudaSuccess) return false;
+        err = cudaStreamWaitEvent(cs, ev, 0);
+        if (err != cudaSuccess) return false;
     }
-    return cudaDeviceSynchronize() == cudaSuccess;
+
+    int done = 0;
+    while (done < n_tokens) {
+        const int slot = (start_pos + done) % feature_ring.cap;
+        const int run = std::min(n_tokens - done, feature_ring.cap - slot);
+        const void * src = (const char *)act_out->data +
+            (size_t)(chunk_start + done) * src_stride;
+        void * dst = (char *)feature_ring.target_feat->data +
+            (size_t)slot * dst_stride + dst_layer_offset;
+
+        // Fast path: F32 same-device D2D on the copy stream.
+        if (feature_ring.storage_type == GGML_TYPE_F32 &&
+            src_device == feature_ring.device && cs) {
+            const size_t src_row_bytes = row_elems * sizeof(float);
+            cudaError_t err = cudaMemcpy2DAsync(
+                dst, dst_stride, src, src_stride,
+                src_row_bytes, (size_t)run,
+                cudaMemcpyDeviceToDevice, cs);
+            if (err != cudaSuccess) return false;
+        } else {
+            // Fallback: general path (cross-device or non-F32) on default stream.
+            if (!convert_device_f32_rows_to_feature_type(feature_ring,
+                                                         src,
+                                                         src_device,
+                                                         src_stride,
+                                                         dst,
+                                                         dst_stride,
+                                                         (size_t)run,
+                                                         row_elems)) {
+                return false;
+            }
+        }
+        done += run;
+    }
+    // No device-sync: the copy stream runs concurrently with the next layer's
+    // compute on the default stream.  Readers (copy_feature_ring_range_to_tensor)
+    // sync the copy stream before consuming the ring data.
+    return true;
 }
 
 bool copy_host_capture_slice_to_draft_ring(
@@ -413,14 +573,26 @@ bool copy_host_capture_slice_to_draft_ring(
     const size_t expected = (size_t)n_tokens * (size_t)hidden;
     if (host_elems != expected) return false;
     const size_t dst_stride = feature_ring.target_feat->nb[1];
-    const size_t row_bytes = (size_t)hidden * sizeof(float);
-    for (int i = 0; i < n_tokens; ++i) {
-        const int slot = (start_pos + i) % feature_ring.cap;
-        const float * src = host + (size_t)i * (size_t)hidden;
-        const size_t dst_offset =
-            (size_t)slot * dst_stride +
-            (size_t)capture_idx * (size_t)hidden * sizeof(float);
-        ggml_backend_tensor_set(feature_ring.target_feat, src, dst_offset, row_bytes);
+    const size_t src_stride = (size_t)hidden * sizeof(float);
+    const size_t dst_layer_offset =
+        (size_t)capture_idx * ggml_row_size(feature_ring.storage_type, hidden);
+    int done = 0;
+    while (done < n_tokens) {
+        const int slot = (start_pos + done) % feature_ring.cap;
+        const int run = std::min(n_tokens - done, feature_ring.cap - slot);
+        const float * src = host + (size_t)done * (size_t)hidden;
+        void * dst = (char *)feature_ring.target_feat->data +
+            (size_t)slot * dst_stride + dst_layer_offset;
+        if (!copy_host_f32_rows_to_feature_type(feature_ring,
+                                                src,
+                                                src_stride,
+                                                dst,
+                                                dst_stride,
+                                                (size_t)run,
+                                                (size_t)hidden)) {
+            return false;
+        }
+        done += run;
     }
     return true;
 }
@@ -432,6 +604,12 @@ bool copy_feature_ring_range_to_tensor(
     int n_tokens) {
     if (!feature_ring.target_feat || !dst || feature_ring.cap <= 0) return false;
     if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
+
+    // Wait for any in-flight async ring writes to finish before reading.
+    if (feature_ring.copy_stream) {
+        cudaError_t err = cudaStreamSynchronize((cudaStream_t)feature_ring.copy_stream);
+        if (err != cudaSuccess) return false;
+    }
 
     const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
     const size_t row_bytes = (size_t)fc_in * sizeof(float);
@@ -476,19 +654,62 @@ bool copy_feature_ring_range_to_host_f32(
     if (!feature_ring.target_feat || feature_ring.cap <= 0) return false;
     if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
 
+    // Wait for any in-flight async ring writes to finish before reading.
+    if (feature_ring.copy_stream) {
+        cudaError_t err = cudaStreamSynchronize((cudaStream_t)feature_ring.copy_stream);
+        if (err != cudaSuccess) return false;
+    }
+
     const int fc_in = feature_ring.n_target_layers * feature_ring.hidden_size;
     const size_t row_bytes = ggml_row_size(feature_ring.storage_type, fc_in);
     const size_t src_stride = feature_ring.target_feat->nb[1];
-    std::vector<uint8_t> row(row_bytes);
     out.resize((size_t)n_tokens * (size_t)fc_in);
 
-    for (int i = 0; i < n_tokens; ++i) {
-        const int slot = (start_pos + i) % feature_ring.cap;
-        ggml_backend_tensor_get(feature_ring.target_feat, row.data(),
-                                (size_t)slot * src_stride, row_bytes);
-        float * dst = out.data() + (size_t)i * (size_t)fc_in;
-        if (!feature_row_to_host_f32(feature_ring.storage_type, row.data(), dst, fc_in)) {
-            return false;
+    // A ring range wraps at most once, so it spans at most two contiguous
+    // segments.  Stage each whole segment in a single bulk D2H — issued
+    // back-to-back on the copy stream so the two transfers pipeline — instead
+    // of one ggml_backend_tensor_get per token (which is n_tokens separate D2H
+    // copies).  For F32 storage the device rows already are f32, so copy the
+    // segment straight into `out`; other dtypes stage the raw rows and convert
+    // on the host afterward.
+    cudaStream_t cs = (cudaStream_t)feature_ring.copy_stream;
+    if (cudaSetDevice(feature_ring.device) != cudaSuccess) return false;
+
+    const bool f32_direct =
+        feature_ring.storage_type == GGML_TYPE_F32 && src_stride == row_bytes;
+    std::vector<uint8_t> staging;   // raw ring bytes, only when conversion is needed
+    if (!f32_direct) staging.resize((size_t)n_tokens * row_bytes);
+
+    for (int done = 0; done < n_tokens; ) {
+        const int slot = (start_pos + done) % feature_ring.cap;
+        const int run = std::min(n_tokens - done, feature_ring.cap - slot);
+        const char * src = (const char *)feature_ring.target_feat->data +
+                           (size_t)slot * src_stride;
+        void * dst = f32_direct
+            ? (void *)(out.data() + (size_t)done * (size_t)fc_in)
+            : (void *)(staging.data() + (size_t)done * row_bytes);
+        cudaError_t err;
+        if (src_stride == row_bytes) {
+            err = cudaMemcpyAsync(dst, src, (size_t)run * row_bytes,
+                                  cudaMemcpyDeviceToHost, cs);
+        } else {
+            // Padded rows: copy the packed segment with a pitched D2H.
+            err = cudaMemcpy2DAsync(dst, row_bytes, src, src_stride,
+                                    row_bytes, (size_t)run,
+                                    cudaMemcpyDeviceToHost, cs);
+        }
+        if (err != cudaSuccess) return false;
+        done += run;
+    }
+    if (cudaStreamSynchronize(cs) != cudaSuccess) return false;
+
+    if (!f32_direct) {
+        for (int i = 0; i < n_tokens; ++i) {
+            const uint8_t * src_row = staging.data() + (size_t)i * row_bytes;
+            float * dst = out.data() + (size_t)i * (size_t)fc_in;
+            if (!feature_row_to_host_f32(feature_ring.storage_type, src_row, dst, fc_in)) {
+                return false;
+            }
         }
     }
     return true;

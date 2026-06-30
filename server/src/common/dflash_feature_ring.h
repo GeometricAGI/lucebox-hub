@@ -35,6 +35,11 @@ struct DraftFeatureMirror {
     int n_target_layers = 0;
     int hidden_size = 0;
     ggml_type storage_type = GGML_TYPE_F32;
+
+    // Async copy stream: ring writes go here so they overlap with the next
+    // layer's compute on the default stream.  Readers sync this before access.
+    void * copy_stream = nullptr;       // cudaStream_t (opaque to avoid cuda header in .h)
+    void * compute_done_event = nullptr; // cudaEvent_t
 };
 
 void draft_feature_mirror_free(DraftFeatureMirror & mirror);
