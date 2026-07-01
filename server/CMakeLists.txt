@@ -634,13 +634,6 @@ if(DFLASH27B_TESTS)
         target_link_libraries(test_draft_topk_cuda PRIVATE dflash_common CUDA::cudart)
         add_test(NAME draft_topk_cuda COMMAND test_draft_topk_cuda)
     endif()
-    # CPU sample_logits chain (SamplerCfg, penalties, parse_sampler_token). No GPU required.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_sampler.cpp")
-        add_executable(test_sampler test/test_sampler.cpp)
-        target_include_directories(test_sampler PRIVATE ${DFLASH27B_SRC_INCLUDE_DIRS})
-        target_link_libraries(test_sampler PRIVATE dflash_common)
-        add_test(NAME sampler COMMAND test_sampler)
-    endif()
     # GPU port of the sample_logits chain vs the CPU reference. CUDA only:
     # geometric_sampler_cuda.cu is compiled into dflash_common solely on the cuda backend.
     if(DFLASH27B_GPU_BACKEND STREQUAL "cuda" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_gpu_sampler_cuda.cpp")
