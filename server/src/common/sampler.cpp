@@ -21,9 +21,11 @@ int sample_logits(const float * logits_in,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng) {
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
-    // GPU path (opt-in via DFLASH_GPU_SAMPLE). top_k>0 and any CUDA error return
-    // -1 and fall through to the CPU chain below. The single uniform draw is made
-    // here on the host so the RNG stream advances identically to the CPU path.
+    // GPU path (on by default; set DFLASH_GPU_SAMPLE=0 to disable). top_k>0,
+    // top_p in (0,1) (both unsupported on the GPU, see geometric_sampler_cuda.h),
+    // and any CUDA error return -1 and fall through to the CPU chain below.
+    // The single uniform draw is made here on the host so the RNG stream
+    // advances identically to the CPU path.
     if (gpu_sampler_enabled() && gpu_sampler_supports(cfg)) {
         double r = 0.0;
         if (cfg.temp > 0.0f) {

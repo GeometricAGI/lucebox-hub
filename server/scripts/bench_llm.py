@@ -20,13 +20,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Point HF at the workspace cache before importing transformers, so offline
-# tokenizer lookups resolve without the caller exporting HF_HOME every time.
-if not os.environ.get("HF_HOME"):
-    _wks_hf = Path("/workspace/.hf_home")
-    if _wks_hf.is_dir():
-        os.environ["HF_HOME"] = str(_wks_hf)
-
 # Shared math-scoring helpers (canonical copy in harness/).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "harness"))
 from math_scoring import _extract_boxed, _math_equiv, _normalize_math
@@ -50,9 +43,9 @@ N_GEN = 256
 BUDGET = 22  # default; overridden by --budget CLI arg
 N_SAMPLE = int(os.environ.get("DFLASH_N_SAMPLE", "10"))
 # Optional sampler tail for the DFlash run, "temp,top_p,top_k,rep_pen,seed[,freq,pres]".
-# When set, exercises the sample_logits chain (and its GPU port under
-# DFLASH_GPU_SAMPLE=1) instead of the default greedy path. AR (test_generate) is
-# greedy-only and ignores this.
+# When set, exercises the sample_logits chain (and its GPU port, on by default,
+# opt out with DFLASH_GPU_SAMPLE=0) instead of the default greedy path. AR
+# (test_generate) is greedy-only and ignores this.
 SAMP = os.environ.get("DFLASH_SAMP", "").strip()
 
 def _gsm_gold(x):

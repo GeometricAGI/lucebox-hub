@@ -2,7 +2,7 @@
 // the CPU/GPU split rationale, and sampler.cpp for the reference CPU chain this
 // mirrors: rep_penalty -> freq/pres_penalty -> softmax(temp) -> draw.
 // top_p (nucleus) is not implemented here — cfg.top_p in (0,1) falls back to
-// the CPU chain (see geometric_sampler_cuda.h); it's deferred to a follow-up PR.
+// the CPU chain (see geometric_sampler_cuda.h).
 //
 // The per-call workload is one logit row (vocab ~150k). That is small enough
 // that a single thread block handles the whole row: it keeps every reduction
@@ -221,7 +221,8 @@ fail:
 bool gpu_sampler_enabled() {
     static const bool on = []() {
         const char * v = std::getenv("DFLASH_GPU_SAMPLE");
-        return v != nullptr && v[0] != '0' && v[0] != '\0';
+        if (v == nullptr || v[0] == '\0') return true;  // on by default
+        return v[0] != '0';                             // "0" (or "0...") opts out
     }();
     return on;
 }
