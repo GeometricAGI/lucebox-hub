@@ -59,12 +59,14 @@ size_t nucleus_cutoff(std::vector<std::pair<float, int>> & cand, double target, 
 }
 
 // Draws a token from `cand`, whose .first fields are proportional
-// probabilities (need not already sum to 1 or be sorted).
-int draw_from_weights(const std::vector<std::pair<float, int>> & cand, std::mt19937_64 & rng) {
+// probabilities (need not already sum to 1 or be sorted). `r_uniform` is a
+// pre-drawn uniform in [0,1) supplied by the caller (drawn once per
+// sample_logits call) so every path — GPU, GPU-assisted top_p, or CPU —
+// consumes the same single RNG value.
+int draw_from_weights(const std::vector<std::pair<float, int>> & cand, double r_uniform) {
     double Z = 0.0;
     for (auto & c : cand) Z += c.first;
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    const double r = u(rng) * Z;
+    const double r = r_uniform * Z;
     double acc = 0.0;
     for (auto & c : cand) {
         acc += c.first;
@@ -86,7 +88,7 @@ int draw_from_weights(const std::vector<std::pair<float, int>> & cand, std::mt19
 // nucleus_cutoff's O(vocab) std::nth_element passes regardless of who
 // computed the input probabilities, so skipping the CPU-side exp() pass here
 // is a net win (measured ~1.4x faster end-to-end at vocab=151936).
-int sample_from_gpu_probs(std::vector<float> & probs, double top_p, std::mt19937_64 & rng) {
+int sample_from_gpu_probs(std::vector<float> & probs, double top_p, double r_uniform) {
     std::vector<std::pair<float, int>> cand(probs.size());
     for (size_t i = 0; i < probs.size(); i++) cand[i] = {probs[i], (int)i};
 
@@ -96,7 +98,7 @@ int sample_from_gpu_probs(std::vector<float> & probs, double top_p, std::mt19937
     const size_t cut = nucleus_cutoff(cand, target, [](auto & c){ return (double)c.first; });
     cand.resize(cut);
 
-    return draw_from_weights(cand, rng);
+    return draw_from_weights(cand, r_uniform);
 }
 #endif
 
@@ -107,19 +109,25 @@ int sample_logits(const float * logits_in,
                   const SamplerCfg & cfg,
                   const std::vector<int32_t> & history,
                   std::mt19937_64 & rng) {
+    // Draw the single uniform up front, exactly once, and only when we will
+    // actually sample (temp>0; greedy returns before any draw). It is then
+    // threaded through every path below — the full-GPU draw, the GPU-assisted
+    // top_p draw, and the CPU draw all consume this same value — so the RNG
+    // stream advances identically no matter which path resolves the token
+    // (including a GPU→CPU fallback), keeping decode reproducible whether the
+    // GPU sampler is on or off.
+    double r_uniform = 0.0;
+    if (cfg.temp > 0.0f) {
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        r_uniform = u(rng);
+    }
+
 #ifdef DFLASH27B_HAVE_GPU_SAMPLER
     // GPU path (on by default; set DFLASH_GPU_SAMPLE=0 to disable). top_k>0,
     // top_p in (0,1) (both unsupported on the GPU, see geometric_sampler_cuda.h),
     // and any CUDA error return -1 and fall through to the CPU chain below.
-    // The single uniform draw is made here on the host so the RNG stream
-    // advances identically to the CPU path.
     if (gpu_sampler_enabled() && gpu_sampler_supports(cfg)) {
-        double r = 0.0;
-        if (cfg.temp > 0.0f) {
-            std::uniform_real_distribution<double> u(0.0, 1.0);
-            r = u(rng);
-        }
-        const int g = geometric_sample_logits_cuda(logits_in, vocab, cfg, history, r,
+        const int g = geometric_sample_logits_cuda(logits_in, vocab, cfg, history, r_uniform,
                                          /*logits_on_device=*/false);
         if (g >= 0) return g;
     }
@@ -141,7 +149,7 @@ int sample_logits(const float * logits_in,
         std::vector<float> gpu_probs(vocab);
         if (geometric_compute_probs_cuda(logits_in, vocab, cfg, history,
                                          gpu_probs.data(), /*logits_on_device=*/false)) {
-            return sample_from_gpu_probs(gpu_probs, cfg.top_p, rng);
+            return sample_from_gpu_probs(gpu_probs, cfg.top_p, r_uniform);
         }
         // else: fall through to the full CPU chain below.
     }
@@ -243,7 +251,7 @@ int sample_logits(const float * logits_in,
     // probs already sums to ~1) — reuse it instead of re-deriving the same
     // loop a second time.
     for (size_t i = 0; i < cand.size(); i++) cand[i].first = probs[i];
-    return draw_from_weights(cand, rng);
+    return draw_from_weights(cand, r_uniform);
 }
 
 bool parse_sampler_token(std::string & line, SamplerCfg & out) {

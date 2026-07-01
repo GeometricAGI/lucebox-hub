@@ -127,7 +127,7 @@ constexpr size_t kSampleShmemPerThread = 2 * sizeof(float);
 // first call — same single-threaded-decode-loop assumption as Scratch below.
 // Queried rather than hardcoded because maxThreadsPerBlock and
 // sharedMemPerBlock vary across GPUs (e.g. older compute-capability parts cap
-// at 512 threads and/or less shared memory than the 1024-thread/20-byte-per-
+// at 512 threads and/or less shared memory than the 1024-thread/8-byte-per-
 // thread shape that fits an RTX 3090).
 struct BlockCfg {
     int device = -1;
@@ -281,9 +281,10 @@ __global__ void geometric_sample_kernel(float * __restrict__ work, int vocab,
     // (This per-thread array can't be collapsed into the warp-shuffle
     // reductions above — thread 0 needs every individual chunk mass, not just
     // their sum, to compute the prefix offsets.)
-    float pm = 0.0f;
-    for (int i = begin; i < end; i++)
-        pm += expf(work[i] * inv_t - xmax);
+    // Each thread's chunk mass is exactly the partial sum it already accumulated
+    // for Z in pass 2 — block_reduce_sum takes `lz` by value, so it is still
+    // intact here. Reuse it instead of a second O(vocab) expf pass over the row.
+    const float pm = lz;
     sh[t] = pm;
     __syncthreads();
 

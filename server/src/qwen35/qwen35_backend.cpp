@@ -1598,16 +1598,28 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
             int g_tok = -1;
             if (gpu_sampler_enabled() && gpu_sampler_supports(sampler_) &&
                 sg_.logits && sg_.logits->data) {
+                // Draw the uniform from a copy of the RNG so the real stream is
+                // not advanced yet; we only commit that single draw if the GPU
+                // path succeeds (below). On fallback the stream is untouched and
+                // sample_logits() draws the identical value it would with the
+                // GPU disabled, so the token stream is reproducible either way.
                 double r = 0.0;
                 if (sampler_.temp > 0.0f) {
+                    std::mt19937_64 rng_peek = sampler_rng_;
                     std::uniform_real_distribution<double> u(0.0, 1.0);
-                    r = u(sampler_rng_);
+                    r = u(rng_peek);
                 }
                 g_tok = geometric_sample_logits_cuda(
                     static_cast<const float *>(sg_.logits->data), vocab, sampler_,
                     out_tokens, r, /*logits_on_device=*/true);
             }
             if (g_tok >= 0) {
+                // Commit the single uniform the GPU draw consumed, so the RNG
+                // advances by exactly one draw — matching the CPU/GPU-off path.
+                if (sampler_.temp > 0.0f) {
+                    std::uniform_real_distribution<double> u(0.0, 1.0);
+                    (void)u(sampler_rng_);
+                }
                 next_tok = g_tok;
             } else
 #endif
