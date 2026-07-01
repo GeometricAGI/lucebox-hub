@@ -1,12 +1,14 @@
 // CUDA port of the sample_logits chain. See geometric_sampler_cuda.h for the contract and
 // the CPU/GPU split rationale, and sampler.cpp for the reference CPU chain this
-// mirrors: rep_penalty -> freq/pres_penalty -> softmax(temp) -> top_p -> draw.
+// mirrors: rep_penalty -> freq/pres_penalty -> softmax(temp) -> draw.
+// top_p (nucleus) is not implemented here — cfg.top_p in (0,1) falls back to
+// the CPU chain (see geometric_sampler_cuda.h); it's deferred to a follow-up PR.
 //
 // The per-call workload is one logit row (vocab ~150k). That is small enough
-// that a single thread block handles the whole row: it keeps every reduction,
-// the nucleus threshold search and the inverse-CDF scan in shared memory with no
-// cross-block synchronization, which is far simpler and — for one row per token
-// — fast enough. (The bandwidth-bound multi-block split used by
+// that a single thread block handles the whole row: it keeps every reduction
+// and the inverse-CDF scan in shared memory with no cross-block
+// synchronization, which is far simpler and — for one row per token — fast
+// enough. (The bandwidth-bound multi-block split used by
 // geometric_draft_topk_cuda.cu pays off only for many rows at once.)
 
 #include "geometric_sampler_cuda.h"
@@ -21,12 +23,45 @@ namespace dflash::common {
 
 namespace {
 
-constexpr int kBlock = 1024;  // threads per block (power of two for reductions).
-                              // The row is processed by a single block, so use
-                              // the maximum to extract what parallelism one block
-                              // can (a single block is still only ~1 SM — see the
-                              // microbench/notes on why this workload barely fits
-                              // the GPU).
+constexpr int kPenaltyBlock = 256;  // threads per block for the elementwise penalty
+                                    // kernel; not perf-sensitive (a few hundred
+                                    // elements at most), so no device query needed.
+
+// geometric_sample_kernel's per-thread shared-memory footprint: two double
+// arrays (sh, s_off) and one int32 array (shi), each sized [blockDim.x].
+constexpr size_t kSampleShmemPerThread = 2 * sizeof(double) + sizeof(int32_t);
+
+// Per-device sample-kernel block size (threads per row), cached after the
+// first call — same single-threaded-decode-loop assumption as Scratch below.
+// Queried rather than hardcoded because maxThreadsPerBlock and
+// sharedMemPerBlock vary across GPUs (e.g. older compute-capability parts cap
+// at 512 threads and/or less shared memory than the 1024-thread/20-byte-per-
+// thread shape that fits an RTX 3090).
+struct BlockCfg {
+    int device = -1;
+    int block  = 0;
+};
+BlockCfg g_block_cfg;
+
+int pick_block_size(int device) {
+    if (g_block_cfg.device == device) return g_block_cfg.block;
+    int    max_threads = 1024;
+    size_t smem_cap    = 48 * 1024;  // conservative fallback if the query fails
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+        max_threads = prop.maxThreadsPerBlock;
+        smem_cap    = prop.sharedMemPerBlock;
+    } else {
+        cudaGetLastError();
+    }
+    int block = 1;
+    while (block * 2 <= max_threads) block *= 2;  // largest power of two <= max_threads
+    // Halve further if the reductions' shared-memory arrays wouldn't fit
+    // (stays a power of two so the block-reduction loop below still works).
+    while (block > 32 && (size_t)block * kSampleShmemPerThread > smem_cap) block /= 2;
+    g_block_cfg = {device, block};
+    return block;
+}
 
 // Apply the (already-prepared) penalties in place to the working logit copy.
 // One thread per affected token id. `rep_inv` is 1/rep_pen folded in by the host
@@ -46,19 +81,26 @@ __global__ void geometric_apply_penalties(float * __restrict__ work,
     work[id] = v;
 }
 
+// Dynamic shared memory for geometric_sample_kernel, sized at launch to
+// blockDim.x * kSampleShmemPerThread (see pick_block_size). Laid out as two
+// double arrays (8-byte aligned, so they come first) then one int32 array.
+extern __shared__ unsigned char geometric_smem[];
+
 // Single-block sampler. work[] holds the post-penalty logits. Writes the chosen
 // token id to *out. do_sample==0 -> greedy argmax (lowest id wins ties, matching
 // the CPU manual-argmax and DFLASH_GPU_ARGMAX behaviour).
 __global__ void geometric_sample_kernel(const float * __restrict__ work, int vocab,
-                              float inv_t, int do_sample, float top_p,
+                              float inv_t, int do_sample,
                               double r_uniform, int32_t * __restrict__ out) {
-    const int t     = threadIdx.x;
-    const int chunk = (vocab + kBlock - 1) / kBlock;
-    const int begin = t * chunk;
-    const int end   = min(begin + chunk, vocab);
+    const int t        = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int chunk    = (vocab + nthreads - 1) / nthreads;
+    const int begin    = t * chunk;
+    const int end      = min(begin + chunk, vocab);
 
-    __shared__ double sh[kBlock];
-    __shared__ int    shi[kBlock];
+    double * sh    = reinterpret_cast<double *>(geometric_smem);
+    double * s_off = sh + nthreads;
+    int    * shi   = reinterpret_cast<int *>(s_off + nthreads);
     __shared__ float  s_xmax;
     __shared__ int    s_argmax;
     __shared__ double s_scalar;
@@ -72,7 +114,7 @@ __global__ void geometric_sample_kernel(const float * __restrict__ work, int voc
     }
     sh[t] = lmax; shi[t] = largmax;
     __syncthreads();
-    for (int s = kBlock / 2; s > 0; s >>= 1) {
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
         if (t < s) {
             const double a = sh[t], b = sh[t + s];
             if (b > a || (b == a && shi[t + s] < shi[t])) { sh[t] = b; shi[t] = shi[t + s]; }
@@ -94,7 +136,7 @@ __global__ void geometric_sample_kernel(const float * __restrict__ work, int voc
         lz += exp((double)work[i] * inv_t - xmax);
     sh[t] = lz;
     __syncthreads();
-    for (int s = kBlock / 2; s > 0; s >>= 1) {
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
         if (t < s) sh[t] += sh[t + s];
         __syncthreads();
     }
@@ -102,85 +144,32 @@ __global__ void geometric_sample_kernel(const float * __restrict__ work, int voc
     __syncthreads();
     const double Z = s_scalar;
 
-    // ---- top_p (nucleus): bisect a threshold in x-space -------------------
-    // Find the largest threshold `thr` whose tail mass {x_i >= thr} is still
-    // >= top_p*Z; that tail is the smallest set of highest-prob tokens whose
-    // cumulative probability reaches top_p (nucleus semantics). top_p>=1 keeps
-    // everything (thr = -inf, Msel = Z).
-    float  thr  = -FLT_MAX;
-    double Msel = Z;
-    if (top_p < 1.0f) {
-        const double target = (double)top_p * Z;
-        float lo = xmax - 80.0f;  // exp(-80) ~ 1e-35: tail below this is negligible
-        float hi = xmax;
-        // 32 bisection steps resolve the threshold to ~80/2^32 in x-space — far
-        // finer than float spacing near the top of the distribution.
-        for (int it = 0; it < 32; it++) {
-            const float mid = 0.5f * (lo + hi);
-            double m = 0.0;
-            for (int i = begin; i < end; i++) {
-                const double x = (double)work[i] * inv_t;
-                if (x >= mid) m += exp(x - xmax);
-            }
-            sh[t] = m;
-            __syncthreads();
-            for (int s = kBlock / 2; s > 0; s >>= 1) {
-                if (t < s) sh[t] += sh[t + s];
-                __syncthreads();
-            }
-            const double mass = sh[0];
-            __syncthreads();
-            if (mass >= target) lo = mid; else hi = mid;  // largest thr meeting target
-        }
-        thr = lo;
-        double m = 0.0;
-        for (int i = begin; i < end; i++) {
-            const double x = (double)work[i] * inv_t;
-            if (x >= thr) m += exp(x - xmax);
-        }
-        sh[t] = m;
-        __syncthreads();
-        for (int s = kBlock / 2; s > 0; s >>= 1) {
-            if (t < s) sh[t] += sh[t + s];
-            __syncthreads();
-        }
-        if (t == 0) s_scalar = sh[0];
-        __syncthreads();
-        Msel = s_scalar;
-    }
-
-    // ---- multinomial inverse-CDF draw over the nucleus -------------------
+    // ---- multinomial inverse-CDF draw over the full distribution ---------
     // Each thread owns a contiguous id chunk, so ascending-id order is exactly
     // thread 0's chunk, then thread 1's, ... A serial exclusive scan over the
-    // (kBlock) per-thread masses gives each thread its CDF offset; the one whose
+    // nthreads per-thread masses gives each thread its CDF offset; the one whose
     // [offset, offset+mass) straddles the target re-scans its chunk for the id.
     double pm = 0.0;
-    for (int i = begin; i < end; i++) {
-        const double x = (double)work[i] * inv_t;
-        if (x >= thr) pm += exp(x - xmax);
-    }
+    for (int i = begin; i < end; i++)
+        pm += exp((double)work[i] * inv_t - xmax);
     sh[t] = pm;
     __syncthreads();
 
     // Thread 0: seed the safety default (used only if fp rounding leaves no
     // straddling thread) and compute the exclusive prefix offsets.
-    __shared__ double s_off[kBlock];
     if (t == 0) {
         *out = s_argmax;
         double acc = 0.0;
-        for (int k = 0; k < kBlock; k++) { s_off[k] = acc; acc += sh[k]; }
+        for (int k = 0; k < nthreads; k++) { s_off[k] = acc; acc += sh[k]; }
     }
     __syncthreads();
 
-    const double targetv = r_uniform * Msel;
+    const double targetv = r_uniform * Z;
     if (targetv >= s_off[t] && targetv < s_off[t] + pm) {
         double acc = s_off[t];
         for (int i = begin; i < end; i++) {
-            const double x = (double)work[i] * inv_t;
-            if (x >= thr) {
-                acc += exp(x - xmax);
-                if (targetv < acc) { *out = i; break; }
-            }
+            acc += exp((double)work[i] * inv_t - xmax);
+            if (targetv < acc) { *out = i; break; }
         }
     }
 }
@@ -247,6 +236,9 @@ int geometric_sample_logits_cuda(const float * logits,
     // top_k stays on the CPU (a single-row partial_sort beats a per-token GPU
     // select); signal fallback.
     if (cfg.top_k > 0 && cfg.top_k < vocab) return -1;
+    // top_p (nucleus) is not implemented on this kernel; signal fallback (see
+    // geometric_sampler_cuda.h for why).
+    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) return -1;
 
     // Pick the device. For a device pointer, derive it from the allocation so we
     // run where the logits live; otherwise use the current device.
@@ -298,17 +290,18 @@ int geometric_sample_logits_cuda(const float * logits,
                        cudaMemcpyHostToDevice);
             cudaMemcpy(g_scratch.d_pen_add, pen_add.data(), (size_t)m * sizeof(float),
                        cudaMemcpyHostToDevice);
-            const int blocks = (m + kBlock - 1) / kBlock;
-            geometric_apply_penalties<<<blocks, kBlock>>>(g_scratch.d_work, g_scratch.d_pen_id,
+            const int blocks = (m + kPenaltyBlock - 1) / kPenaltyBlock;
+            geometric_apply_penalties<<<blocks, kPenaltyBlock>>>(g_scratch.d_work, g_scratch.d_pen_id,
                                                 g_scratch.d_pen_add, m, cfg.rep_pen,
                                                 rep_active ? 1 : 0);
         }
         if (err == cudaSuccess) {
-            const int   do_sample = (cfg.temp > 0.0f) ? 1 : 0;
-            const float inv_t     = 1.0f / fmaxf(1e-3f, cfg.temp);
-            const float top_p     = (cfg.top_p > 0.0f && cfg.top_p < 1.0f) ? cfg.top_p : 1.0f;
-            geometric_sample_kernel<<<1, kBlock>>>(g_scratch.d_work, vocab, inv_t, do_sample,
-                                         top_p, r_uniform, g_scratch.d_out);
+            const int    do_sample    = (cfg.temp > 0.0f) ? 1 : 0;
+            const float  inv_t        = 1.0f / fmaxf(1e-3f, cfg.temp);
+            const int    block        = pick_block_size(dev);
+            const size_t shmem_bytes  = (size_t)block * kSampleShmemPerThread;
+            geometric_sample_kernel<<<1, block, shmem_bytes>>>(g_scratch.d_work, vocab, inv_t, do_sample,
+                                         r_uniform, g_scratch.d_out);
             int32_t tok = -1;
             if (cudaGetLastError() == cudaSuccess &&
                 cudaMemcpy(&tok, g_scratch.d_out, sizeof(int32_t),

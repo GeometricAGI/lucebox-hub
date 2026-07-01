@@ -3296,22 +3296,6 @@ static std::vector<double> cpu_softmax(const std::vector<float> & logits, float 
     return p;
 }
 
-// Analytic nucleus (top_p) distribution: keep highest-prob tokens until the
-// cumulative reaches top_p (inclusive of the crossing token), renormalize.
-static std::vector<double> cpu_nucleus(std::vector<double> p, float top_p) {
-    std::vector<int> idx(p.size());
-    for (size_t i = 0; i < p.size(); i++) idx[i] = (int)i;
-    std::sort(idx.begin(), idx.end(), [&](int a, int b){ return p[a] > p[b]; });
-    std::vector<double> q(p.size(), 0.0);
-    double cum = 0.0, keep = 0.0;
-    for (int i : idx) {
-        q[i] = p[i]; keep += p[i]; cum += p[i];
-        if (cum >= top_p) break;
-    }
-    for (auto & x : q) x /= keep;
-    return q;
-}
-
 // Greedy (temp=0): GPU must pick exactly the same token as the CPU chain, with
 // and without penalties active.
 static void test_gpu_sampler_greedy_matches_cpu() {
@@ -3397,34 +3381,18 @@ static void test_gpu_sampler_temperature_distribution() {
     TEST_ASSERT_MSG(l1 < 0.03, "GPU temp-sample dist must match analytic softmax (L1<0.03)");
 }
 
-// Nucleus sampling: GPU draws must (a) never fall outside the analytic nucleus
-// and (b) match the renormalized nucleus distribution the CPU path produces.
-static void test_gpu_sampler_top_p_distribution() {
+// top_p in (0,1) is intentionally unimplemented on the GPU (removed; see
+// geometric_sampler_cuda.h): the GPU entry must signal fallback (-1), same
+// contract as top_k>0.
+static void test_gpu_sampler_top_p_falls_back() {
     if (!gpu_sampler_test_available()) { std::fprintf(stderr, " (skip: no CUDA) "); return; }
-    const int vocab = 24;
-    auto logits = gpu_test_logits(vocab, 7);
+    const int vocab = 128;
+    auto logits = gpu_test_logits(vocab, 5);
     SamplerCfg cfg; cfg.temp = 1.0f; cfg.top_p = 0.8f;
-    auto p = cpu_softmax(logits, cfg.temp);
-    auto nucleus = cpu_nucleus(p, cfg.top_p);
-
-    std::mt19937_64 rng(2024);
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    std::vector<int> hist(vocab, 0);
     std::vector<int32_t> history;
-    const int n = 120000;
-    int valid = 0, out_of_nucleus = 0;
-    for (int i = 0; i < n; i++) {
-        const int tok = geometric_sample_logits_cuda(logits.data(), vocab, cfg, history, u(rng), false);
-        if (tok < 0 || tok >= vocab) continue;
-        valid++; hist[tok]++;
-        if (nucleus[tok] == 0.0) out_of_nucleus++;
-    }
-    TEST_ASSERT_MSG(valid > 0, "GPU nucleus sampling produced draws");
-    // Allow a tiny boundary leak from the continuous threshold bisection.
-    TEST_ASSERT_MSG(out_of_nucleus < n / 500, "GPU draws stay within the analytic nucleus");
-    double l1 = 0.0;
-    for (int k = 0; k < vocab; k++) l1 += std::fabs((double)hist[k] / valid - nucleus[k]);
-    TEST_ASSERT_MSG(l1 < 0.04, "GPU nucleus dist must match CPU analytic nucleus (L1<0.04)");
+    const int gpu_tok = geometric_sample_logits_cuda(logits.data(), vocab, cfg, history,
+                                           0.3, /*on_device=*/false);
+    TEST_ASSERT_MSG(gpu_tok == -1, "top_p in (0,1) must return -1 (CPU fallback)");
 }
 
 // Direct CPU-vs-GPU agreement on the same draws is not bit-exact (different
@@ -3502,7 +3470,7 @@ static void gpu_sampler_microbench() {
     std::fprintf(stderr, "[microbench] vocab=%d iters=%d (per call; >1.0x = GPU faster)\n", vocab, iters);
     { SamplerCfg c;                                   bench("greedy (temp=0)", c); }
     { SamplerCfg c; c.temp = 0.8f;                    bench("temp=0.8 (full vocab)", c); }
-    { SamplerCfg c; c.temp = 0.8f; c.top_p = 0.95f;   bench("temp=0.8 top_p=0.95", c); }
+    // top_p is unimplemented on the GPU (always falls back to CPU), so it's not benched here.
     { SamplerCfg c; c.temp = 0.8f; c.rep_pen = 1.2f;
       std::vector<int32_t> h; for (int i = 0; i < 200; i++) h.push_back(i * 7 % vocab);
       history = h; bench("temp=0.8 rep_pen=1.2", c); history.clear(); }
@@ -4660,7 +4628,7 @@ int main() {
     RUN_TEST(test_gpu_sampler_greedy_penalties_match_cpu);
     RUN_TEST(test_gpu_sampler_top_k_falls_back);
     RUN_TEST(test_gpu_sampler_temperature_distribution);
-    RUN_TEST(test_gpu_sampler_top_p_distribution);
+    RUN_TEST(test_gpu_sampler_top_p_falls_back);
     RUN_TEST(test_gpu_sampler_modal_token_matches_cpu);
 #endif
 
